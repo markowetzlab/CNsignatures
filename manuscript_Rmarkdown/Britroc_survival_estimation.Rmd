@@ -1,0 +1,91 @@
+---
+title: "Survival Interval Estimation"
+author: "Dilrini De Silva"
+output: 
+  html_document:
+    code_folding: hide
+---
+###Data preprocessing
+This section describes how the survival intervals in the Britroc-1 cohort were calculated from raw data files generated from the Britroc clinical trial database. The following raw data files required for the calculation can be obtained by writing to the Data Access Committee:  
+1. reg.csv - Registration Information  
+2. bas.csv - Baseline Information  
+3. flchm.csv - First Line Chemotherapy Information  
+4. flrsp.csv - First Line Response Information  
+5. dnf.csv - Death Notification Information  
+6. biop.csv - Image Guided Biopsy Information  
+
+Records in the flchm.csv file were filtered to retain only patients that had received platinum-based therapy as first line treatment. In instances where only month and year were available for certain time points the date was assumed to be the 1st of the month to enable calculations.  
+
+
+```{r, eval=F}
+# run this code if processing from raw data files placed in the 'restricted_data/' folder
+suppressMessages(library(tidyr))
+suppressMessages(library(dplyr))
+suppressMessages(library(zoo))
+
+filepath <-"restricted_data/"
+filenames <- c("flchm", "flrsp", "bas", "dnf", "reg", "biop")
+
+for(fname in filenames){
+  assign(fname,read.csv(paste0(filepath,fname,".csv"),na.strings=c(""," ","NA"), as.is = T))
+}
+
+# subset flchm to platinum-based therapy only
+
+flchm <- flchm %>%
+  filter(grepl("PLAT", DRUG1)) %>%
+  select(-DRUG1)
+
+# use full_join to keep missing information across datasets, combine dataframes by TRIALNO and retain only columns necessary for subsequent analysis
+
+tokeep <- c("STUDYNO", "TRIALNO", "STAGE", "STGABC" , "DIAGDATE", "DIAGDATE_MONTH", "DIAGDATE_YEAR", "DTPROG1", "DTPROG1_MONTH","DTPROG1_YEAR", "DOD", "DTALIVE", "REGDATE", "AGE", "BIOPDT")
+
+merged <- full_join(bas,flchm ,by="TRIALNO") %>% 
+  full_join(flrsp,by="TRIALNO")  %>%
+  full_join(dnf,by="TRIALNO") %>%
+  full_join(reg,by="TRIALNO") %>% 
+  select(one_of(tokeep)) %>%
+  distinct
+
+# format columns containing date information into date type
+datecols <- c("DIAGDATE", "DTPROG1", "DOD", "DTALIVE", "REGDATE")
+merged[datecols] = lapply(merged[datecols], as.Date, "%m/%d/%Y")
+
+# fill in missing DIAGDATE and DTPROG1 values as 1st of the month where only month and year info is available
+idx <- which(is.na(merged$DIAGDATE) & !is.na(merged$DIAGDATE_MONTH) & !is.na(merged$DIAGDATE_YEAR))
+dates <- paste0(merged$DIAGDATE_MONTH[idx],merged$DIAGDATE_YEAR[idx])
+merged$DIAGDATE[idx] <- as.Date(as.yearmon(dates, format = "%b%Y"))
+idx.dtprog1 <- which(is.na(merged$DTPROG1) & !is.na(merged$DTPROG1_MONTH)& !is.na(merged$DTPROG1_YEAR))
+dates.dtprog1 <- paste0(merged$DTPROG1_MONTH[idx.dtprog1],merged$DTPROG1_YEAR[idx.dtprog1])
+merged$DTPROG1[idx.dtprog1] <- as.Date(as.yearmon(dates.dtprog1, format = "%b%Y"))
+
+# add last documented clinical assessment (DTLAST) date and survival status (STATUS) columns as of 1 December 2016
+# DTLAST: DTALIVE or DOD
+# STATUS: a death event was recorded as 1 and survival as 0  
+merged$DTLAST <- merged$DTALIVE
+survidx <- which(!is.na(merged$DOD))
+merged$DTLAST[survidx] <- merged$DOD[survidx]
+merged$STATUS <- 1  
+merged$STATUS[survidx] <- 0
+
+# overall survival in BriTROC-1 patients was calculated from the date of enrolment to the date of death or the last documented clinical assessment, with data cutoff at 1 December 2016.
+merged$PFS <- difftime(merged$DTPROG1, merged$DIAGDATE)
+merged$OS <- difftime(merged$DTLAST, merged$DIAGDATE)
+
+merged$INT_START <- difftime(merged$REGDATE,merged$DIAGDATE)
+merged$INT_END <- difftime(merged$DTLAST,merged$DIAGDATE)
+
+# remove erroneous rows with negative end dates
+merged <- filter(merged,INT_START < INT_END)
+
+out <- merged %>%
+  select(TRIALNO, AGE, STATUS, PFS, OS, INT_START, INT_END)
+write.table(out, file = "data/britroc_survival_intervals.tsv", sep = "\t", quote = F, row.names = F)
+
+```
+
+
+
+
+
+

@@ -1,0 +1,227 @@
+---
+title: "CN signature survival analysis"
+author: "Geoff Macintyre"
+output: html_document
+---
+
+
+Given that the BritROC study only enrolled patients with relapsed disease, it was necessary to left truncate the overall survival time. In addition, cases where the patient was not deceased were right censored. We combined the BritROC, PCAWG and TCGA cases and fit a Cox proportinal hazards model. We stratifed by study (BritROC, OV-US, OV-AU and TCGA).
+
+###Compiling training and test cohorts
+```{r echo=TRUE}
+library(survival)
+set.seed(seed)
+samp_num<-0.7 #fraction of the data considered training
+
+tcga_clin<-read.table("data/tcga_sample_info.tsv",stringsAsFactors = F,header=T,sep="\t")
+pcawg_clin<-read.table("data/pcawg_sample_info.tsv",sep="\t",header=T,stringsAsFactors = F)
+pcawg_cohort<-read.table("data/pcawg_cohort_info.tsv",header=T,sep="\t",stringsAsFactors = F)
+
+#britroc survival data
+pat_info<-samp_annotation[,c("Britroc_No","IM.JBLAB_ID","star_rating")]
+pat_info<-samp_annotation[grepl("IM",samp_annotation$IM.JBLAB_ID),]
+pat_info<-pat_info[order(pat_info$Britroc_No,pat_info$star_rating,decreasing = T),]
+pat_info<-pat_info[!duplicated(pat_info$Britroc_No),]
+pat_info<-pat_info[!pat_info$IM.JBLAB_ID%in%c("IM_91","IM_70"),]#remove misclassified samples
+surv_dat<-read.table("data/britroc_survival_intervals.tsv",sep="\t",header=T,stringsAsFactors = F)
+surv_dat<-surv_dat[!duplicated(surv_dat$TRIALNO),]
+britroc_surv_dat<-merge(surv_dat,pat_info,by.x=1,by.y=1)
+rownames(britroc_surv_dat)<-britroc_surv_dat$IM.JBLAB_ID
+britroc_surv_dat<-britroc_surv_dat[colnames(sig_pat_mat_britroc_all)[colnames(sig_pat_mat_britroc_all)%in%rownames(britroc_surv_dat)],]
+britroc_surv_dat<-britroc_surv_dat[!(is.na(britroc_surv_dat$INT_START)|is.na(britroc_surv_dat$INT_END)),]
+britroc_surv_dat<-britroc_surv_dat[!(britroc_surv_dat$INT_START>britroc_surv_dat$INT_END),]
+britroc_train<-rownames(britroc_surv_dat)
+britroc_test<-rownames(britroc_surv_dat)[!rownames(britroc_surv_dat)%in%britroc_train]
+
+#pcawg survival data
+pdat<-pcawg_cohort[pcawg_cohort$tumor_wgs_aliquot_id%in%colnames(sig_pat_mat_pcawg),c("tumor_wgs_aliquot_id","icgc_donor_id","dcc_project_code")]
+pdat<-merge(pdat,pcawg_clin[,c("icgc_donor_id","donor_vital_status","donor_survival_time","donor_interval_of_last_followup","donor_age_at_diagnosis")],by.x=2,by.y=1)
+pdat<-pdat[!duplicated(pdat$tumor_wgs_aliquot_id),]
+rownames(pdat)<-pdat$tumor_wgs_aliquot_id
+pdat<-pdat[colnames(sig_pat_mat_pcawg),]
+pcawg_surv_dat<-pdat
+pcawg_os<-pcawg_surv_dat$donor_survival_time
+pcawg_os[is.na(pcawg_os)]<-pcawg_surv_dat$donor_interval_of_last_followup[is.na(pcawg_os)]
+pcawg_surv_dat$os<-pcawg_os
+pcawg_event<-pcawg_surv_dat$donor_vital_status
+pcawg_event<-plyr::revalue(pcawg_event,c("deceased"=1,"alive"=0))
+pcawg_surv_dat$event<-pcawg_event
+pcawg_train<-sample(rownames(pcawg_surv_dat),round(samp_num*nrow(pcawg_surv_dat)))
+pcawg_test<-rownames(pcawg_surv_dat)[!rownames(pcawg_surv_dat)%in%pcawg_train]
+
+#tcga survival data
+tcga_surv_dat<-tcga_clin
+tcga_surv_dat<-tcga_surv_dat[!is.na(tcga_surv_dat$age_at_initial_pathologic_diagnosis),]
+tcga_surv_dat<-tcga_surv_dat[tcga_surv_dat$bcr_aliquot_barcode%in%colnames(sig_pat_mat_tcga),]
+tcga_surv_dat<-tcga_surv_dat[!is.na(tcga_surv_dat$days_to_last_followup),]
+tcga_survival_sigmat<-sig_pat_mat_tcga
+tcga_os<-tcga_surv_dat$days_to_death
+tcga_status<-!is.na(tcga_os)
+tcga_surv_dat$status<-tcga_status
+tcga_os[is.na(tcga_os)]<-tcga_surv_dat$days_to_last_followup[is.na(tcga_os)]
+tcga_surv_dat$os<-tcga_os
+tcga_train<-sample(rownames(tcga_surv_dat),round(samp_num*nrow(tcga_surv_dat)))
+tcga_test<-rownames(tcga_surv_dat)[!rownames(tcga_surv_dat)%in%tcga_train]
+
+
+combined_sig_pat_mat<-cbind(sig_pat_mat_britroc_all[,rownames(britroc_surv_dat)],
+                            sig_pat_mat_pcawg[,rownames(pcawg_surv_dat)],
+                            sig_pat_mat_tcga[,tcga_surv_dat$bcr_aliquot_barcode])
+
+#threshold low exposure values to 2%
+combined_sig_pat_mat[combined_sig_pat_mat<=0.02]<-0.02
+
+combined_os_survival<-survival::Surv(time= c(britroc_surv_dat$INT_START,
+                                   rep(1,length(pcawg_os)),
+                                   rep(1,length(tcga_os))),
+                           time2=c(britroc_surv_dat$INT_END,
+                                   pcawg_surv_dat$os,
+                                   tcga_surv_dat$os),
+                           event=c(!britroc_surv_dat$STATUS,
+                                   as.numeric(pcawg_surv_dat$event)==1,
+                                   tcga_surv_dat$status))
+survival_ids<-c(rownames(britroc_surv_dat),rownames(pcawg_surv_dat),rownames(tcga_surv_dat))
+
+sig_data<-data.frame(t(combined_sig_pat_mat),
+                     study=c(rep("britroc",nrow(britroc_surv_dat)),
+                             pcawg_surv_dat$dcc_project_code,rep("TCGA",nrow(tcga_surv_dat))),
+                     age=c(britroc_surv_dat$AGE,
+                           pcawg_surv_dat$donor_age_at_diagnosis,
+                           tcga_surv_dat$age_at_initial_pathologic_diagnosis),
+                     stringsAsFactors = F)
+#stratify by age
+sig_data$age.cat<-car::recode(as.numeric(sig_data$age), "lo:39=1; 40:44=2; 45:49=3; 50:54=4; 55:59=5; 60:64=6; 65:69=7; 70:74=8; 75:79=9; 80:hi=10")
+```
+
+As the signatures sum to 1, in order to perform survival analysis the exposures had to be normalised using the signature with the lowest variance:
+
+```{r}
+#determine signature with lowest variance
+which.min(apply(combined_sig_pat_mat,1,var))
+
+#normalise signature exposures
+sig_data_unorm<-sig_data
+sig_data[,1:nsig]<-apply(sig_data[,1:nsig],2,function(x){log2(mapply("/",x,sig_data[,5]))})
+
+#split data into training and test cohorts
+sig_data_train<-sig_data[survival_ids%in%c(britroc_train,pcawg_train,tcga_train),]
+sig_data_test<-sig_data[survival_ids%in%c(britroc_test,pcawg_test,tcga_test),]
+combined_os_survival_train<-combined_os_survival[survival_ids%in%c(britroc_train,pcawg_train,tcga_train)]
+combined_os_survival_test<-combined_os_survival[survival_ids%in%c(britroc_test,pcawg_test,tcga_test)]
+```
+
+###Fitting a cox-proportional hazard model (training)
+Here we fit a cox proportional hazards model to predict survival with the normlised signature exposures as covariates, stratified by study and age.
+```{r coxph, echo=TRUE}
+os_coxph<-coxph(combined_os_survival_train ~ s1+s2+s3+s4+s6+s7 + strata(study, age.cat,na.group=T), data = sig_data_train)
+summary(os_coxph)
+
+#test for proportional hazards
+cox.zph(os_coxph)
+```
+
+Note: exp(coef) is the Hazard ratio.
+
+###Testing the cox-proportional hazard model (test)
+Here we tested the ability of the cox proportional hazards model to predict overall survival using the concordance index. 
+```{r echo=TRUE}
+#predict survival using coxph model
+train_predict<-predict(os_coxph,type="risk")
+test_predict<-predict(os_coxph,newdata=sig_data_test,type="risk")
+
+perf <- survcomp::concordance.index(x = test_predict, surv.time = combined_os_survival_test[,"stop"],
+                          surv.event = combined_os_survival_test[, "status"], method = "noether",na.rm = TRUE)
+perf[1:5]
+```
+
+###Fitting cox-proportional hazard model (all data)
+We then fit a second cox proportional hazards model to the combined test and training data.
+```{r echo=TRUE}
+os_coxph<-coxph(combined_os_survival~ s1+s2+s3+s4+s6+s7 + strata(study, age.cat,na.group=T), data = sig_data)
+summary(os_coxph)
+
+#check for non-proportional hazards
+cox.zph(os_coxph)
+
+#Compute hazard ratio table
+predicted_survival<-predict(os_coxph,type="risk")
+
+HR <- round(exp(coef(os_coxph)), 2)
+CI <- round(exp(confint(os_coxph)), 2)
+P <- round(coef(summary(os_coxph))[,5], 3)
+colnames(CI) <- c("Lower", "Higher")
+hazard_table <- as.data.frame(cbind(HR, CI, P))
+hazard_table<-cbind(Signature=row.names(hazard_table),hazard_table)
+knitr::kable(hazard_table)
+```
+
+###Unsupervised clustering of patients using signature exposures
+To group patients based on their copy-number signature exposures we used the [NBClust](https://cran.r-project.org/package=NbClust) package to determine the number of clusters present in the data and cluster the patients.
+
+```{r}
+mydata<-t(combined_sig_pat_mat[,])
+#determine number of clusters
+fit <- NbClust::NbClust(mydata,method="ward.D2")
+
+#visualise signature exposures within clusters
+sig_data$clust=fit$Best.partition
+
+pdat<-data.frame(t(combined_sig_pat_mat))
+pdat$clust<-fit$Best.partition
+pdat$sample<-rownames(pdat)
+pdat<-reshape2::melt(pdat,id.vars=c(8,9))
+pdat$variable<-plyr::revalue(pdat$variable,
+                            c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+ggplot(pdat,aes(x=variable,y=value))+geom_boxplot()+geom_jitter(alpha=0.1)+facet_grid(clust ~ .)+my_theme+xlab("Signature")+ylab("Exposure")
+```
+
+###Clustering membership plot
+```{r, fig.height=2}
+pdat$sample<-factor(pdat$sample,levels=names(predicted_survival)[order(predicted_survival,decreasing=T)])
+pdat$clust<-factor(pdat$clust,levels=3:1)
+clust_plot<-ggplot(pdat,aes(y=clust,x=sample))+geom_tile()+my_theme+theme(axis.text.x =element_blank(),axis.ticks.x = element_blank())+
+  xlab("")+ylab("")+scale_fill_discrete()+theme(legend.position = "none")
+clust_plot
+```
+
+###Fitting cox-proportional hazard model for clusters
+We also fit a cox-proportional hazards model using the clusters as covariates.
+```{r echo=TRUE}
+sig_data$clust<-factor(sig_data$clust,levels=3:1)
+os_coxph<-coxph(combined_os_survival~ clust + strata(study, age.cat), data = sig_data)
+summary(os_coxph)
+cox.zph(os_coxph)
+```
+
+While this model showed significant predictive preformance, the exposures across the clusters (above) reveal that cluster 2 is based primarily on signal from signature 1 exposures, and thus a cluster based model does not add information above and beyond the signature model.
+
+###Visualising cox-proportional hazard model
+```{r echo=FALSE}
+#plot all survival
+pdat_survsig<-reshape2::melt(cbind(sig_pat_mat_britroc,sig_pat_mat_pcawg,sig_pat_mat_tcga))
+colnames(pdat_survsig)<-c("Signature","Patient","Exposure")
+pdat_survsig<-pdat_survsig[pdat_survsig$Patient%in%names(predicted_survival),]
+pdat_survsig$Patient<-factor(pdat_survsig$Patient,levels=names(predicted_survival)[order(predicted_survival,decreasing=T)])
+pdat_survsig$Patient<-factor(pdat_survsig$Patient)
+
+p1<-ggplot(pdat_survsig,aes(x=Patient,y=as.numeric(Exposure),fill=Signature))+geom_bar(stat="identity")+
+      scale_fill_manual( values = cbPalette)+my_theme+
+      theme(axis.text.x = element_blank(),axis.ticks.x=element_blank(),
+            axis.text=element_text(size=5),axis.title=element_text(size=7),
+            legend.text = element_text(size = 7),legend.title=element_text(size=7),
+            legend.position='none',
+            plot.margin = margin(0, 0, 0, 0, "cm"),panel.background = element_blank())+xlab("")+
+      ylab("")
+
+p2<-ggplot(pdat_survsig,aes(x=Patient,y=Exposure,colour=Signature,group=Signature))+
+      geom_smooth(se=F,lwd=0.3,method="lm")+
+      theme_bw()+
+      scale_colour_manual(values = cbPalette)+
+      theme(axis.text.x = element_blank(),axis.ticks.x=element_blank(),
+            axis.text=element_text(size=5),axis.title=element_text(size=7),
+            legend.text = element_text(size = 7),legend.title=element_text(size=7),
+            legend.position='none',
+            plot.margin = margin(-0.1, 0, 0, 0, "cm"))+xlab("")+
+      ylab("")
+cowplot::plot_grid(p1,clust_plot,p2,align="v",ncol=1,rel_heights = c(0.45,0.1,0.45))
+```

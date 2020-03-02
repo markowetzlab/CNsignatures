@@ -1,0 +1,94 @@
+---
+title: "CN signature progression analysis"
+author: "Geoff Macintyre"
+date: "24/08/2017"
+output: html_document
+---
+
+```{r echo=FALSE}
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(knitr))
+suppressMessages(library(ggpubr))
+```
+
+Here we used cases with archival samples (pre-treatment) and matched relapse samples (post-treatment) to explore whether treatment affected copy-number signatures, or if copy-number signatures could predict response. 
+```{r, eval=F}
+#this code chuck is not run by default due to data restrictions. Please obtain the reg.csv file from the Britroc DACO and put it in the restricted_data directory to run
+#extract exposures for cases with paried samples
+clin<-read.table("restricted_data/reg.csv",sep=",",header=T,stringsAsFactors = F,quote="")
+clin<-clin[,c("TRIALNO","PLATINUM")]
+clin$PLATINUM<-plyr::revalue(as.character(clin$PLATINUM),c("1"="Sensitive","2"="Resistant"))
+priorlines<-read.table("data/prior_lines.csv",sep=",",header=T,stringsAsFactors = F,quote="")
+samp_annotation_clin<-merge(samp_annotation,clin,by.x=1,by.y=1,all.x=T)
+samp_annotation_clin<-merge(samp_annotation_clin,priorlines,by.x=1,by.y=1,all.x=T)
+
+samples<-samp_annotation_clin[samp_annotation_clin$IM.JBLAB_ID%in%colnames(sig_pat_mat_britroc_all),c(1,2,8,9,10)]
+
+
+samples<-samples %>% 
+  mutate(sample=ifelse(grepl("IM",IM.JBLAB_ID),"P","R")) %>%
+  arrange(Britroc_No,desc(star_rating))%>%
+  group_by(sample) %>% distinct(Britroc_No,.keep_all = TRUE)
+
+samples[samples$IM.JBLAB_ID=="IM_91"|samples$IM.JBLAB_ID=="IM_70","sample"]<-"R"
+
+samples[samples$sample=="P","PriorLinesChemo"]<-0
+samples[is.na(samples$PriorLinesChemo),"PriorLinesChemo"]<-0
+
+paired_samples<-samples %>% group_by(Britroc_No) %>% filter(n()>1) %>% as.data.frame
+
+paired_dat<-reshape2::melt(sig_pat_mat_britroc_all[,colnames(sig_pat_mat_britroc_all)%in%paired_samples$IM.JBLAB_ID])
+paired_dat<-merge(paired_dat,paired_samples,by.x=2,by.y=2)
+colnames(paired_dat)<-c("ID","Signature","Exposure","Britroc_No","star_rating","status","prior_chemo","sample")
+saveRDS(paired_dat,"data/paired_sample_details.rds")
+```
+
+Use a linear model to test if signature exposures change in repsonse to treatment:
+```{r}
+library(broom)
+paired_dat<-readRDS("data/paired_sample_details.rds")
+curr_dat<-filter(paired_dat,Britroc_No!=45&Britroc_No!=32)
+curr_dat<-tidyr::spread(curr_dat[,c(2,3,4,6,8)],key="sample",value="Exposure")
+
+prepost_dat<-merge(curr_dat,surv_dat[,c("TRIALNO","AGE","PFS","OS")],by.x=2,by.y=1)
+prepost_dat<-merge(prepost_dat,unique(paired_dat[paired_dat$sample=="R",c(4,7)]),by.x=1,by.y=1)
+
+prepost_dat$status<-factor(prepost_dat$status,levels=c("Sensitive","Resistant"))
+prepost_dat$change=prepost_dat$R-prepost_dat$P
+prepost_dat$Signature=factor(prepost_dat$Signature,levels=paste0("s",c(5,1:4,6:8)))
+
+#centre AGE
+prepost_dat$AGE2<-(prepost_dat$AGE-mean(prepost_dat$AGE))/sqrt(var(prepost_dat$AGE))
+
+colnames(prepost_dat)<-c("Britroc_No","Signature","status","diagnosis_exposure","relapse_exposure",
+                         "AGE","time_to_relapse","overall_survival","prior_lines_chemo","change_in_exposure","centered_AGE")
+
+#signature changes from diagnosis to relapse taking into account prior exposure, time, and age
+diff_sig_time<-prepost_dat %>%
+  group_by(Signature) %>%
+  do(model=lm(log(relapse_exposure+1)~log(diagnosis_exposure+1)+time_to_relapse+centered_AGE+prior_lines_chemo,data=.)) %>% 
+  tidy(model) %>% mutate(pval.adj = p.adjust (p.value, method='BH')) 
+
+knitr::kable(diff_sig_time%>%
+  filter(pval.adj<0.05)) %>%
+  kableExtra::kable_styling(full_width = T)
+```
+
+Use a generalised linear model to test if signature exposures at diagnosis predict response:
+```{r}
+#do signature predict response at diagnosis
+diff_sig_response<-prepost_dat %>%
+  group_by(Signature) %>%
+  do(model=glm(I(status=="Sensitive")~diagnosis_exposure+centered_AGE,data=.,family="binomial")) %>%
+  tidy(model) %>%mutate(pval.adj = p.adjust (p.value, method='BH')) 
+
+knitr::kable(diff_sig_response%>%
+  filter(pval.adj<0.05)) %>%
+  kableExtra::kable_styling(full_width = T)
+```
+
+
+
+
+

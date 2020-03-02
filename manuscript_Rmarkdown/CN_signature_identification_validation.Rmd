@@ -1,0 +1,904 @@
+---
+title: "Copy-number identification and validation"
+author: "Geoff Macintyre"
+output:
+  html_document: default
+---
+
+
+The analysis in this document starts from preprocessed copy-number profiles for all datasets due to restrictions on the underlying raw data. Details on how to reproduce the results from raw data can be found in the main manuscript.  
+
+```{r echo=FALSE}
+cbPalette <- c(RColorBrewer::brewer.pal(8,"Dark2"),RColorBrewer::brewer.pal(9,"Set1"),"black")
+ggplot2::theme_set(ggplot2::theme_gray(base_size = 5))
+my_theme<-ggplot2::theme_bw()+ggplot2::theme(axis.text=ggplot2::element_text(size=5),
+                   axis.title=ggplot2::element_text(size=5),
+                   strip.text.x = ggplot2::element_text(size = 7),
+                   strip.text.y = ggplot2::element_text(size = 7),
+                   legend.text = ggplot2::element_text(size = 7),
+                   panel.grid.minor = ggplot2::element_blank(),
+                   panel.grid.major = ggplot2::element_blank())
+```
+
+```{r load_sample_metadata, echo=FALSE}
+samp_annotation<-read.table("data/britroc_sample_data.csv",stringsAsFactors = F,sep = ",",header=T)
+```
+
+###BriTROC-1 sample filtering and curation
+A total of `r nrow(samp_annotation)` samples were shallow whole-genome and tagged amplicon sequenced. Raw data were processed as outlined in the main manuscript. After inspection of the TP53 mutation status and relative copy-number profiles, `r sum(samp_annotation$Failed=="Y")` were excluded from downstream analysis for the following reasons:
+
+```{r echo=FALSE}
+table(samp_annotation[samp_annotation$Failed=="Y","Notes"])
+```
+
+Samples were then processed using ABCEL (to be released) to generate absolute copy-number profiles. All samples were manually inspected and the copy-number fit adjusted if necessary (based on evidence from other samples from the same patient).
+
+Following absolute copy-number fitting, the samples were rated using a 1-3 star system. 
+
+* 1 star samples showed a noisy copy-number profile and were considered likely to have incorrect segments and missing calls. These were excluded from further analysis. 
+* 2 star samples showed a reasonable copy-number profile with only a small number of miscalled segments. These samples were used (with caution) for some subsequent analyses. 
+* 3 star samples showed a high-quality copy-number profile that was used in all downstream analyses.
+
+Star rating per sample:
+```{r echo=FALSE}
+table(samp_annotation[!samp_annotation$Failed=="Y","star_rating"])
+```
+
+
+Maximum star rating per case:
+```{r echo=FALSE}
+result<- samp_annotation %>% 
+  filter(!samp_annotation$Failed=="Y") %>%
+  dplyr::select(Britroc_No,IM.JBLAB_ID,star_rating) %>%
+  dplyr::group_by(Britroc_No) %>%
+  dplyr::slice(which.max(star_rating))
+
+knitr::kable(result %>% 
+  group_by(star_rating) %>% tally())
+```
+
+###Assessing absolute copy-number fits
+```{r child = 'WGS_ploidy_purity_correlation.Rmd'}
+```
+
+##Extracting copy-number features
+For signature analysis we opted to use cases with 3 star copy-number profiles (total=91).
+
+In order to perform copy-number signature identification we summarised each copy-number profile using a number of different feature distributions:
+
+* Segment size
+* Breakpoint number (per ten megabases)
+* Change-point copy-number
+* Segment copy-number
+* Breakpoint number (per chromosome arm)
+* Length of segments with oscillating copy-number
+
+```{r extract_CN_features, echo=TRUE,cache=T}
+#read in absolute CN post ABCEL processing
+all_CN<-readRDS("data/britroc_absolute_copynumber.rds")
+all_CN<-all_CN[,colnames(all_CN)%in%samp_annotation[!samp_annotation$Failed=="Y","IM.JBLAB_ID"]]
+
+#extract 3 star CN from each case
+ids<-result %>% filter(star_rating==3)
+ids<-ids$IM.JBLAB_ID
+hq_CN<-all_CN[,colnames(all_CN)%in%ids]
+ids<-result %>% filter(star_rating==2)
+ids<-ids$IM.JBLAB_ID
+lq_CN<-all_CN[,colnames(all_CN)%in%ids]
+
+#estract copy-number features
+CN_features<-extractCopynumberFeatures(hq_CN,cores=num_cores)
+```
+
+Following copy-number feature extraction we applied mixture modelling to breakdown each feature distribution into mixtures of Gaussian or mixtures of Poisson distributions using the [flexmix](https://cran.r-project.org/web/packages/flexmix/index.html) package.
+
+```{r fit_mixtures, cache=TRUE, results="hide"}
+seed=77777
+min_prior=0.001
+model_selection="BIC"
+nrep=1
+niter=1000
+
+dat<-as.numeric(CN_features[["segsize"]][,2])
+segsize_mm<-fitComponent(dat,seed=seed,model_selection=model_selection,
+                         min_prior=min_prior,niter=niter,nrep=nrep,min_comp=10,max_comp=10)
+
+dat<-as.numeric(CN_features[["bp10MB"]][,2])
+bp10MB_mm<-fitComponent(dat,dist="pois",seed=seed,model_selection=model_selection,
+                        min_prior=min_prior,niter=niter,nrep=nrep,min_comp=3,max_comp=3)
+
+dat<-as.numeric(CN_features[["osCN"]][,2])
+osCN_mm<-fitComponent(dat,dist="pois",seed=seed,model_selection=model_selection,
+                      min_prior=min_prior,niter=niter,nrep=nrep,min_comp=3,max_comp=3)
+
+dat<-as.numeric(CN_features[["bpchrarm"]][,2])
+bpchrarm_mm<-fitComponent(dat,dist="pois",seed=seed,model_selection=model_selection,
+                          min_prior=min_prior,niter=niter,nrep=3,min_comp=2,max_comp=5)
+
+dat<-as.numeric(CN_features[["changepoint"]][,2])
+changepoint_mm<-fitComponent(dat,seed=seed,model_selection=model_selection,
+                             min_prior=min_prior,niter=niter,nrep=nrep,min_comp=7,max_comp=7)
+
+dat<-as.numeric(CN_features[["copynumber"]][,2])
+copynumber_mm<-fitComponent(dat,seed=seed,model_selection=model_selection,
+                            nrep=nrep,min_comp=2,max_comp=10,min_prior=0.005,niter=2000)
+
+CN_components<-list(segsize=segsize_mm,bp10MB=bp10MB_mm,osCN=osCN_mm,changepoint=changepoint_mm,copynumber=copynumber_mm,bpchrarm=bpchrarm_mm)
+```
+
+Once the components were identified we then generated a sample-by-component matrix representing the sum of posterior probabilities of each copy-number event being assigned to each component.  
+
+```{r}
+britroc_sample_component_matrix<-generateSampleByComponentMatrix(CN_features,CN_components,cores=1,subcores=num_cores)
+NMF::aheatmap(britroc_sample_component_matrix,fontsize = 7,Rowv=FALSE,Colv=FALSE,legend = T,breaks=c(seq(0,199,2),500),main="Component x Sample matrix")
+```
+
+##Signature identification
+We used the [NMF package](https://cran.r-project.org/web/packages/NMF/index.html) to factorise the sample-by-component matrix into a signature-by-sample matrix and component by signature matrix.  
+
+###Selecting the optimum number of signatures
+Previous studies suggest that there should be a minimum of roughly 4 detectable signatures representing mutagenic processes which give rise to distinct patterns of copy-number change: breakage-fusion-bridge, duplicator phenotype, chromothripsis, and amplifier phenotype. Our ability to detect these depends on whether each pattern is sufficiently represented in our data. As NMF demands the upper bound on the number of signatures be << than both the sample and component number, we chose a signature search interval of [3,12]. We ran the matrix factorisation 1000 times for each number of signatures, each with a different random seed, and compared the cophentic, dispersion, silhouette, and sparseness scores for the signature-feature matrix (basis), patient-signature matrix (coefficients) and a consensus matrix of patient-by-patient across the 1000 runs. In addition we performed 1000 random shuffles of the input matrix to get a null estimate of each of the scores. 
+
+```{r Signature_selection, cache=TRUE,echo=TRUE,fig.width=9}
+nmfalg<-"brunet"
+seed<-77777
+estim.r <- NMF::nmfEstimateRank(t(britroc_sample_component_matrix), 3:12,seed = seed,nrun=1000,
+                            verbose=F,method=nmfalg,.opt = paste0("p",num_cores))
+V.random <- randomize(t(britroc_sample_component_matrix))
+estim.r.random <- NMF::nmfEstimateRank(V.random, 3:12, seed =seed,nrun=1000,
+                                   verbose=F,method=nmfalg,.opt = paste0("p",num_cores))
+p<-plot(estim.r,estim.r.random, 
+      what = c("cophenetic", "dispersion","sparseness", "silhouette"),xname="Observed",yname="Randomised",main="")+
+    theme(axis.text=element_text(size=5),axis.title=element_text(size=5),
+                    strip.text.x = element_text(size = 5),
+                    strip.text.y = element_text(size = 5),
+                    legend.text = element_text(size = 5),
+                     legend.title = element_text(size = 7))
+g<-ggplotGrob(p)
+g[["grobs"]][[2]]$children[[4]]$size[[1]]<-0.5
+g[["grobs"]][[3]]$children[[4]]$size[[1]]<-0.5
+g[["grobs"]][[4]]$children[[4]]$size[[1]]<-0.5
+g[["grobs"]][[5]]$children[[4]]$size[[1]]<-0.5
+grid::grid.newpage()
+grid::grid.draw(g)
+```
+
+The plots above suggest that the optimal number of signatures is 7. A signature number higher than this would force the sparseness in the signature by feature matrix (basis) to be greater than that which could be obtained by randomly shuffling the input matrix. 
+
+###Results of NMF
+Derived matrices as heatmaps:
+
+```{r generate_signatures, echo=TRUE, cache=TRUE}
+nsig<-7
+sigs<-NMF::nmf(t(britroc_sample_component_matrix),nsig,seed=seed,nrun=1000,method=nmfalg,.opt = paste0("p",num_cores))
+coefmap(sigs,Colv="consensus",tracks=c("basis:"), main="Patient x Signature matrix")
+basismap(sigs,Rowv=NA,main="Signature x Component matrix")
+```
+
+
+##Signature identification validation
+To test the robustness of the signature identification approach we applied the same procedure to two independent datasets: deep whole-genome sequencing (approximately 40x) of high-grade serous ovarain cancer samples processed as part of the Pan-Cancer Analysis of Whole Genomes project (PCAWG); and SNParray profiling of HGSOC cases as part of TCGA.
+
+###Signature identification in 112 PCAWG cases
+We took the ABSOLUTE copy-number profiles of 112 cases and subjected them to the same feature extraction and NMF procedure as above: 
+
+```{r pcawg_sigs, echo=FALSE, eval=FALSE, cache=TRUE}
+#run this code if processing from raw consensus copy-number profiles
+pcawg_cohort<-read.table("data/pcawg_cohort_info.tsv",header=T,sep="\t",stringsAsFactors = F)
+
+
+#consensus copy-number must be placed in the following directory and files must have the
+#consensus.20170119.somatic.cna.annotated.txt extension
+cndir<-"restricted_data/pcawg_copy-number/"
+
+pcawg_segTabs<-list()
+for(i in pcawg_cohort$tumor_wgs_aliquot_id)
+{
+  if(file.exists(paste0(cndir,i,".consensus.20170119.somatic.cna.annotated.txt")))
+  {
+    cn<-read.table(paste0(cndir,i,".consensus.20170119.somatic.cna.annotated.txt"),header=T,
+                   sep="\t",stringsAsFactors = F)
+    cn<-cn[,c("chromosome","start","end","absolute_broad_major_cn","absolute_broad_minor_cn")]
+    cn<-cbind(cn[,1:3],cn[,4]+cn[,5])
+    colnames(cn)<-c("chromosome","start","end","segVal")
+    cn<-cn[!is.na(cn$segVal),]
+
+    #collapse equal value neighbouring segments
+    segTable<-c()
+    for(c in unique(cn$chromosome))
+    {
+    snfilt<-cn[cn$chromosome==c,]
+    sn.rle<-rle(snfilt[,"segVal"])
+    starts <- cumsum(c(1, sn.rle$lengths[-length(sn.rle$lengths)]))
+    ends <- cumsum(sn.rle$lengths)
+    lapply(1:length(sn.rle$lengths), function(s) {
+      from <- snfilt$start[starts[s]]
+      to <- snfilt$end[ends[s]]
+      segValue <- sn.rle$value[s]
+      c(snfilt$chromosome[starts[s]], from, to, segValue)
+    }) -> segtmp
+    segTableRaw <- data.frame(matrix(unlist(segtmp), ncol=4, byrow=T),stringsAsFactors=F)
+    colnames(segTableRaw)<-c("chromosome","start","end","segVal")
+    segTable<-rbind(segTable,segTableRaw)
+    }
+    if(nrow(cn)>0)
+    {
+      pcawg_segTabs[[i]]<-segTable
+    }
+  }
+}
+pcawg_CN_features<-extractCopynumberFeatures(pcawg_segTabs)
+saveRDS(pcawg_CN_features,"data/pcawg_CN_features.rds")
+```
+
+
+```{r echo=TRUE, fig.width=8, cache=TRUE}
+pcawg_CN_features<-readRDS("data/pcawg_CN_features.rds")
+pcawg_sample_component_matrix<-generateSampleByComponentMatrix(pcawg_CN_features,CN_components)
+
+NMF::aheatmap(pcawg_sample_component_matrix,Rowv=NULL, main="Component x Sample matrix")
+
+pcawg_ids<-rownames(pcawg_sample_component_matrix)
+
+pcawg_sigs<-NMF::nmf(t(pcawg_sample_component_matrix),nsig,seed=seed,nrun=1000,method=nmfalg,.opt = "p16")
+coefmap(pcawg_sigs,Colv="consensus",tracks=c("consensus:"), main="Sample x Signature matrix")#annCol=annCol,
+basismap(pcawg_sigs,Rowv=NA,main="Signature x Component matrix")
+```
+
+###Signature identification in 415 TCGA samples
+We used ABSOLLUTE copy-number calls for 415 samples and applied the same signature identification procedure as above: 
+
+```{r echo=FALSE, eval=FALSE}
+#run this code if processing from raw copy-number data
+#download copy-number segment table from https://www.synapse.org/#!Synapse:syn1710464 into data/ directory
+tcga<-read.table("restricted_data/pancan12_absolute.segtab.txt",sep="\t",header=T,stringsAsFactors = F)
+
+tcga_clin<-read.table("data/tcga_sample_info.tsv",stringsAsFactors = F,header=T,sep="\t")
+tcga<-tcga[tcga$Sample%in%tcga_clin$bcr_aliquot_barcode,]
+
+pcawg_clin<-read.table("data/pcawg_sample_info.tsv",sep="\t",header=T,stringsAsFactors = F)
+
+#filter cases that appear in pcawg
+tcga<-tcga[!substr(tcga$Sample,1,12)%in%pcawg_clin$submitted_donor_id,]
+
+#download sample info file from https://www.synapse.org/#!Synapse:syn1710466 in data/ directory
+tcga_info<-read.table("restricted_data/pancan12.sample_info.txt",sep="\t",header=T,stringsAsFactors = F)
+rownames(tcga_info)<-tcga_info$tcga_id
+tcga_info<-tcga_info[tcga_info$abs_call=="called",]
+tcga_info<-tcga_info[tcga_info$tcga_id%in%tcga$Sample,]
+
+tcga_segTabs<-list()
+for(i in unique(tcga$Sample))
+{
+  tab<-tcga[tcga$Sample==i,c("Chromosome","Start","End","Expected_HSCN_a1","Expected_HSCN_a2")]
+  tab$segVal<-tab$Expected_HSCN_a1+tab$Expected_HSCN_a2
+  tab<-tab[,c(-4,-5)]
+  colnames(tab)<-c("chromosome","start","end","segVal")
+  tcga_segTabs[[i]]<-tab
+}  
+
+tcga_CN_features<-extractCopynumberFeatures(tcga_segTabs)
+saveRDS(tcga_CN_features,"data/tcga_CN_features.rds")
+```
+
+```{r TCGA, echo=TRUE, cache=TRUE}
+tcga_CN_features<-readRDS("data/tcga_CN_features.rds")
+tcga_sample_component_matrix<-generateSampleByComponentMatrix(tcga_CN_features,CN_components)
+NMF::aheatmap(tcga_sample_component_matrix,Rowv=NULL, main="Sample x Component matrix")
+
+tcga_ids<-rownames(tcga_sample_component_matrix)
+
+tcga_sigs<-NMF::nmf(t(tcga_sample_component_matrix),nsig,seed=seed,nrun=1000,method=nmfalg,.opt = "p16")
+coefmap(tcga_sigs,Colv="consensus",tracks=c("consensus:"), main="Sample x Signature matrix")#annCol=annCol,
+basismap(tcga_sigs,Rowv=NA,main="Signature x Component matrix")
+```
+
+###Comparison of signatures across cohorts
+We calculated the Spearman rank correlation between feature vectors for each signature to assess how similar the signatures were across the BRITROC, PCAWG and TCGA cohorts:
+
+```{r echo=T}
+reord_components<-c(11:13,24:31,17:23,32:36,14:16,1:10)
+
+#britroc feat_sig matrix
+feat_sig_mat<-basis(sigs)
+reord_britroc<-as.integer(c(2,6,5,4,7,3,1))
+names(reord_britroc)<-paste0("s",1:7)
+feat_sig_mat<-feat_sig_mat[,reord_britroc]
+colnames(feat_sig_mat)<-paste0("s",1:nsig)
+sig_feat_mat<-t(feat_sig_mat)
+
+#pcawg feat_sig matrix
+feat_sig_mat_pcawg<-basis(pcawg_sigs)[,]
+sig_feat_mat_pcawg<-t(feat_sig_mat_pcawg)
+colnames(feat_sig_mat_pcawg)<-paste0("s",1:nsig)
+
+#tcga feat_sig matrix
+feat_sig_mat_tcga<-basis(tcga_sigs)[,]
+sig_feat_mat_tcga<-t(feat_sig_mat_tcga)
+colnames(feat_sig_mat_tcga)<-paste0("s",1:nsig)
+
+
+#determine matching signatures and their correlation
+reord_pcawg<-apply(feat_sig_mat,2,function(x){which.max(apply(feat_sig_mat_pcawg,2,cor,x,method="s"))})
+sigcor_pcawg<-apply(feat_sig_mat,2,function(x){max(apply(feat_sig_mat_pcawg,2,cor,x,method="s"))})
+
+reord_tcga<-apply(feat_sig_mat,2,function(x){which.max(apply(feat_sig_mat_tcga,2,cor,x,method="s"))})
+sigcor_tcga<-apply(feat_sig_mat,2,function(x){max(apply(feat_sig_mat_tcga,2,cor,x,method="s"))})
+
+#plot the feat_sig matrices side by side
+par(mfrow=c(1,3))
+basismap(sigs,Rowv=NA,Colv=reord_britroc,main="BritROC",tracks=NA)
+basismap(pcawg_sigs,Rowv=NA,Colv=reord_pcawg,main="PCAWG",tracks=NA)
+basismap(tcga_sigs,Rowv=NA,Colv=reord_tcga,main="TCGA",tracks=NA)
+
+#reorder feat_sig matrix
+sig_feat_mat_pcawg<-data.frame(sig_feat_mat_pcawg[reord_pcawg,],stringsAsFactors = F)
+rownames(sig_feat_mat_pcawg)<-paste0("s",1:nsig)
+feat_sig_mat_pcawg<-t(sig_feat_mat_pcawg)
+
+sig_feat_mat_tcga<-data.frame(sig_feat_mat_tcga[reord_tcga,],stringsAsFactors = F)
+rownames(sig_feat_mat_tcga)<-paste0("s",1:nsig)
+feat_sig_mat_tcga<-t(sig_feat_mat_tcga)
+
+b_vs_p<-c()
+for(i in 1:nsig)
+{
+  b_vs_p<-c(b_vs_p,cor.test(feat_sig_mat[,i],feat_sig_mat_pcawg[,i])$p.value)
+}  
+  
+b_vs_t<-c()
+for(i in 1:nsig)
+{
+  b_vs_t<-c(b_vs_t,cor.test(feat_sig_mat[,i],feat_sig_mat_tcga[,i])$p.value)
+}
+
+b_vs_p<-p.adjust(b_vs_p,method="BH")
+b_vs_t<-p.adjust(b_vs_t,method="BH")
+
+sig_comp_out<-rbind(
+  format(round(sigcor_pcawg,2),scientific=F),
+  signif(b_vs_p,1),
+  format(round(sigcor_tcga,2),scientific=F),
+  signif(b_vs_t,1))
+
+rownames(sig_comp_out)<-c("ICGC correlation","ICGC p-value","TCGA correlation","TCGA p-value")
+colnames(sig_comp_out)<-1:nsig
+
+knitr::kable(sig_comp_out)
+
+```
+
+The heatmap and signature correlations above show that the signatures derived from the deep whole-genome sequencing are similar to those derived using sWGS. 
+
+Signature exposure matrices were normalised to sum to one and exposures less than 0.01 were considered 0.
+
+```{r echo=T}
+sig_thresh<-0.01
+
+sig_pat_mat_hq<-scoef(sigs)
+sig_pat_mat_hq<-sig_pat_mat_hq[reord_britroc,]
+rownames(sig_pat_mat_hq)<-paste0("s",1:nsig)
+sig_pat_mat_hq<-normaliseMatrix(sig_pat_mat_hq,sig_thresh)
+
+sig_pat_mat_pcawg<-scoef(pcawg_sigs)
+rownames(sig_pat_mat_pcawg)<-paste0("s",1:nsig)
+sig_pat_mat_pcawg<-sig_pat_mat_pcawg[reord_pcawg,]
+rownames(sig_pat_mat_pcawg)<-paste0("s",1:nsig)
+sig_pat_mat_pcawg<-normaliseMatrix(sig_pat_mat_pcawg,sig_thresh)
+
+sig_pat_mat_tcga<-scoef(tcga_sigs)
+rownames(sig_pat_mat_tcga)<-paste0("s",1:nsig)
+sig_pat_mat_tcga<-sig_pat_mat_tcga[reord_tcga,]
+rownames(sig_pat_mat_tcga)<-paste0("s",1:nsig)
+sig_pat_mat_tcga<-normaliseMatrix(sig_pat_mat_tcga,sig_thresh)
+
+```
+
+
+##Copy-number signature assignment
+We assigned all 2-star copy-number profile samples signature proportions using the LCD function from the [YAPSA package](https://bioconductor.org/packages/release/bioc/html/YAPSA.html). 
+
+```{r cache=TRUE, echo=TRUE}
+#extract features for lower quality samples
+lowquality_britroc_CN_features<-extractCopynumberFeatures(lq_CN)
+lowquality_britroc_sample_component_matrix<-generateSampleByComponentMatrix(lowquality_britroc_CN_features,CN_components)
+britroc_lq_ids<-rownames(lowquality_britroc_sample_component_matrix)
+
+#assign signatures
+sig_pat_mat_lq<-YAPSA::LCD(t(lowquality_britroc_sample_component_matrix),feat_sig_mat)
+rownames(sig_pat_mat_lq)<-paste0("s",1:nsig)
+sig_pat_mat_lq<-normaliseMatrix(sig_pat_mat_lq,sig_thresh)
+
+#assign signatures to remaining 2 and 3 star samples (for cases with multiple samples)
+remain_samp<-samp_annotation[(!samp_annotation$IM.JBLAB_ID%in%colnames(cbind(sig_pat_mat_hq,sig_pat_mat_lq)))&(!samp_annotation$star_rating==1),]
+remain_CN<-all_CN[,colnames(all_CN)%in%remain_samp$IM.JBLAB_ID]
+
+remain_britroc_CN_features<-extractCopynumberFeatures(remain_CN)
+remain_britroc_sample_component_matrix<-generateSampleByComponentMatrix(remain_britroc_CN_features,CN_components)
+
+britroc_remain_ids<-rownames(remain_britroc_sample_component_matrix)
+
+sig_pat_mat_remain<-YAPSA::LCD(t(remain_britroc_sample_component_matrix),feat_sig_mat)
+rownames(sig_pat_mat_remain)<-paste0("s",1:nsig)
+sig_pat_mat_remain<-normaliseMatrix(sig_pat_mat_remain,sig_thresh)
+
+sig_pat_mat_britroc<-cbind(sig_pat_mat_hq,sig_pat_mat_lq)
+sig_pat_mat_britroc_all<-cbind(sig_pat_mat_britroc,sig_pat_mat_remain)
+```
+
+##Visualisations
+###Copy-number signature component weights
+To adopt the same visualisation that has been used for SNV signatures, we generated a histogram for each signature, containing the relative weighting of each of the components, colour coded by the feature distribution they come from. 
+
+```{r echo=FALSE,warning=FALSE,message=FALSE,fig.width=3,fig.height=3}
+temp<-as.data.frame(sig_feat_mat)
+norm_const<-apply(temp,2,sum)
+temp<-data.frame(t(apply(temp,1,function(x){x/norm_const})))
+temp$sig<-rownames(sig_feat_mat)
+pdat<-reshape2::melt(temp,id.vars="sig")
+vars<-gsub("^\\d+|\\d+$", "",as.character(pdat$variable))
+pdat<-cbind(pdat,vars)
+colnames(pdat)<-c("sig","Feature","value","Distribution")
+pdat$sig<-factor(pdat$sig,levels=paste0("s",1:nsig))
+
+pdat$Distribution<-plyr::revalue(pdat$Distribution,
+                               c(bp10MB="Breakpoint number",
+                                 copynumber="Copy-number",
+                                 bpchrarm="Breakpoints per chr arm",
+                                 changepoint="CN changepoint",
+                                 segsize="Segment size",
+                                 osCN="Oscilating CN length"))
+pdat$Distribution<-factor(pdat$Distribution,levels=c("Breakpoint number","Copy-number","CN changepoint","Breakpoints per chr arm","Oscilating CN length","Segment size"))
+pdat$sig<-plyr::revalue(pdat$sig,
+                            c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+for(i in 1:6)
+{
+    print(
+    ggplot(pdat[pdat$sig==i,],aes(x=interaction(Feature,Distribution),y=value,fill=Distribution,group=Distribution))+
+        geom_col(position="dodge")+
+        scale_x_discrete(labels=c(1:3,1:8,1:7,1:3,1:5,1:10))+
+        theme(legend.position="none",axis.text=element_text(size=5),axis.title=element_text(size=5),
+              panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+              panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+        ylab("")+coord_cartesian(ylim=c(0,1))+ggtitle(paste0("Signature ",i))+xlab("Component number")
+        )
+}
+ggplot(pdat[pdat$sig==7,],aes(x=interaction(Feature,Distribution),y=value,fill=Distribution,group=Distribution))+
+        geom_col(position="dodge")+
+        scale_x_discrete(labels=c(1:3,1:8,1:7,1:5,1:3,1:10))+
+        theme(legend.position="right",axis.text=element_text(size=5),axis.title=element_text(size=5),
+              panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+              panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+        ylab("")+coord_cartesian(ylim=c(0,1))+ggtitle(paste0("Signature ",i))+xlab("Component number")
+```
+
+
+
+###Feature distributions for BRITROC cohort
+
+```{r echo=FALSE, cache=TRUE, warning=FALSE, comment=FALSE,fig.width=3,fig.height=3}
+chrlen<-read.table("../data/hg19.chrom.sizes.txt",sep="\t",stringsAsFactors = F)[1:24,]
+
+all_dist_dat<-c()
+seg_num<-getBPnum(Biobase::combine(hq_CN,lq_CN),chrlen)
+all_dist_dat<-rbind(all_dist_dat,cbind(seg_num,distribution="BPnum"))
+
+CN<-getCN(Biobase::combine(hq_CN,lq_CN))
+all_dist_dat<-rbind(all_dist_dat,cbind(CN,distribution="copynum"))
+
+cpCN<-getChangepointCN(Biobase::combine(hq_CN,lq_CN))
+all_dist_dat<-rbind(all_dist_dat,cbind(cpCN,distribution="copynumcp"))
+
+gaps<-read.table("../data/gap_hg19.txt",sep="\t",header=F,stringsAsFactors = F)
+centromeres<-gaps[gaps[,8]=="centromere",]
+centd<-getCentromereDistCounts(Biobase::combine(hq_CN,lq_CN),centromeres,chrlen)
+colnames(centd)<-c("ID","value")
+all_dist_dat<-rbind(all_dist_dat,cbind(centd,distribution="chrarm"))
+
+segsize<-getSegsize(Biobase::combine(hq_CN,lq_CN))
+all_dist_dat<-rbind(all_dist_dat,cbind(segsize,distribution="segsize"))
+
+osc<-getOscilation(Biobase::combine(hq_CN,lq_CN))
+all_dist_dat<-rbind(all_dist_dat,cbind(osc,distribution="osc"))
+
+samp_sig_list<-reshape2::melt(sig_pat_mat_britroc)
+
+fillcol<-cbPalette
+plot_dat<-merge(all_dist_dat,samp_sig_list,
+                  by.x=1, by.y=2)
+colnames(plot_dat)<-c("ID","value","distribution","Signature","Exposure")
+plot_dat$Signature<-factor(plot_dat$Signature,levels = paste0("s",1:nsig))
+names(fillcol)<-paste0("s",1:nsig)
+
+plot_dat$distribution<-plyr::revalue(plot_dat$distribution,
+                               c(BPnum="Breakpoint\ncount\nper 10MB",
+                                 copynum="Copy\n number",
+                                 copynumcp="CN\n changepoint",
+                                 chrarm="Breakpoint\ncount\nper chr arm",
+                                 segsize="Segment\n size",
+                                 osc="Oscilating\n CN length"))
+plot_dat$Signature<-plyr::revalue(plot_dat$Signature,
+                            c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+plot_dat$distribution=factor(plot_dat$distribution,levels = c("Breakpoint\ncount\nper 10MB","Copy\n number","CN\n changepoint","Breakpoint\ncount\nper chr arm","Oscilating\n CN length","Segment\n size"))
+
+
+
+plot_dat.dt <- data.table::data.table(plot_dat)
+data.table::setkey(plot_dat.dt, distribution,Signature)
+plot_dat.dt[, weights.group := sum(as.numeric(Exposure)),by=c("distribution","Signature")]
+
+plot_dat.dt<-data.frame(plot_dat.dt,stringsAsFactors = F)
+
+line_size<-0.25
+
+dist_theme<-my_theme+
+  theme(panel.border = element_blank(),
+        plot.margin = unit(c(0,0.2,-0.3,-0.3), "cm"),
+        axis.text=element_text(size=5),axis.ticks = element_line(colour = "black", size = 0.25),
+        axis.ticks.length=unit(0.05, "cm"),
+        plot.background = element_rect(fill = "transparent"),
+        axis.text.x = element_text(margin=margin(0,1,0,0,"pt")))
+
+
+#plots for overview figures
+bp<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="Breakpoint\ncount\nper 10MB",],aes(x=as.numeric(value)))+
+  geom_histogram(stat="count",size=line_size)+coord_cartesian(xlim=c(0,10))+xlab("")+ylab("")+dist_theme+
+  scale_x_continuous(breaks=c(0,4,8))+ggtitle("Breakpoint count per 10MB")
+print(bp)
+
+os<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="Oscilating\n CN length",],aes(x=as.numeric(value)))+
+  geom_histogram(stat="count",size=line_size)+coord_cartesian(xlim=c(0,10))+xlab("")+ylab("")+dist_theme+
+  scale_x_continuous(breaks=c(0,4,8))+ggtitle("Oscilating CN chain length")
+print(os)
+
+ss<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="Segment\n size",],aes(x=as.numeric(value)))+
+  geom_density(size=line_size)+dist_theme+coord_cartesian(xlim=c(0,119118142))+xlab("")+ylab("")+
+  scale_x_continuous(breaks = c(100000000))+ggtitle("Segment size")
+print(ss)
+
+cn<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="Copy\n number",],aes(x=as.numeric(value)))+
+  geom_density(size=line_size)+coord_cartesian(xlim=c(0,34))+xlab("")+ylab("")+dist_theme+
+  scale_x_continuous(breaks=c(4,16,32))+ggtitle("Copy-number")
+print(cn)
+
+cp<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="CN\n changepoint",],aes(x=as.numeric(value)))+
+  geom_density(size=line_size)+coord_cartesian(xlim=c(0,25))+xlab("")+ylab("")+dist_theme+
+  scale_x_continuous(breaks=c(4,12,22))+ggtitle("CN changepoint")
+print(cp)
+
+ct<-ggplot(plot_dat.dt[plot_dat.dt$distribution=="Breakpoint\ncount\nper chr arm",],aes(x=as.numeric(value)))+
+  geom_histogram(stat="count",size=line_size)+coord_cartesian(xlim=c(0,35))+xlab("")+ylab("")+dist_theme+
+  scale_x_continuous(breaks=c(0,10,30))+ggtitle("Breakpoint count per chr arm")
+
+print(ct)
+```
+
+###Weighted density across all BritROC samples for each signature
+```{r echo=FALSE, cache=TRUE, warning=FALSE, comment=FALSE}
+#facet plot of weighted densities
+theme_density<-theme(axis.text.y=element_blank(),
+                   axis.text=element_text(size=5),axis.title=element_text(size=5),
+                   strip.text.x = element_text(size = 5),
+                   strip.text.y = element_text(size = 5),
+                   legend.text = element_text(size = 5),
+                   legend.position = "none",
+                   panel.grid.minor = element_blank(),panel.grid.major = element_blank())
+
+p1<-ggplot(plot_dat.dt,aes(x=as.numeric(value),fill=distribution,
+                        y=..density..,weight=as.numeric(Exposure)/as.numeric(weights.group)))+
+  geom_histogram(size=line_size,breaks=c(0:9,100000000000))+facet_grid(Signature ~ distribution,scales="free")+
+  scale_x_continuous(breaks=c(0,2,4,6,8,10)+0.5,labels =c(0,2,4,6,8,10) )+theme_bw()+
+      coord_cartesian(xlim=c(0,10))+theme_density+
+      xlab("")
+g1 <- ggplotGrob(p1)
+
+
+p2<-ggplot(plot_dat.dt,aes(x=as.numeric(value),fill=distribution,
+                        y=..density..,weight=as.numeric(Exposure)/as.numeric(weights.group)))+
+  geom_density(size=line_size)+facet_grid(Signature ~ distribution,scales="free")+theme_bw()+
+    scale_x_continuous(breaks=c(0,2,4,6,8,10))+coord_cartesian(xlim=c(0,10),ylim=c(0,0.5))+theme_density
+g2 <- ggplotGrob(p2)
+
+for(i in 9:15)
+{
+  g1[["grobs"]][[i]] <- g2[["grobs"]][[i]]
+}
+g1[["grobs"]][[51]] <- g2[["grobs"]][[51]]
+
+p2<-ggplot(plot_dat.dt,aes(x=as.numeric(value),fill=distribution,
+                        y=..density..,weight=as.numeric(Exposure)/as.numeric(weights.group)))+
+  geom_density(size=line_size)+facet_grid(Signature ~ distribution,scales="free")+theme_bw()+
+    scale_x_continuous(breaks=c(0,2,4,6,8,10))+coord_cartesian(xlim=c(0,10),ylim=c(0,1.6))+theme_density
+g2 <- ggplotGrob(p2)
+
+for(i in 16:22)
+{
+  g1[["grobs"]][[i]] <- g2[["grobs"]][[i]]
+}
+g1[["grobs"]][[52]] <- g2[["grobs"]][[52]]
+
+    
+p2<-ggplot(plot_dat.dt,aes(x=as.numeric(value),fill=distribution,
+                        y=..density..,weight=as.numeric(Exposure)/as.numeric(weights.group)))+
+geom_histogram(size=line_size,breaks=c(0:35,1000000000000))+facet_grid(Signature ~ distribution,scales="free")+theme_bw()+    scale_x_continuous(breaks=c(0,10,20,30))+coord_cartesian(xlim=c(0,35),ylim=c(0,0.6))+theme_density
+g2 <- ggplotGrob(p2)
+
+for(i in 23:29)
+{
+  g1[["grobs"]][[i]] <- g2[["grobs"]][[i]]
+}
+g1[["grobs"]][[53]] <- g2[["grobs"]][[53]]
+
+p2<-ggplot(plot_dat.dt,aes(x=as.numeric(value),fill=distribution,
+                        y=..density..,weight=as.numeric(Exposure)/as.numeric(weights.group)))+
+  geom_density(size=line_size)+facet_grid(Signature ~ distribution,scales="free")+theme_bw()+
+    coord_cartesian(xlim=c(0,3e07),ylim=c(0,1.9e-07))+theme_density+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+g2 <- ggplotGrob(p2)
+
+for(i in 37:43)
+{
+  g1[["grobs"]][[i]] <- g2[["grobs"]][[i]]
+}
+g1[["grobs"]][[55]] <- g2[["grobs"]][[55]]
+
+
+
+for(i in c(2:8)[!c(2:8)%in%c(2,3)])
+{
+  g1$grobs[[i]][["children"]][[3]][["gp"]][["fill"]]<-rep("grey",9)
+}
+
+for(i in c(23:36)[!c(23:36)%in%c(23,31)])
+{
+  g1$grobs[[i]][["children"]][[3]][["gp"]][["fill"]]<-rep("grey",9)
+}
+
+for(i in c(9:22)[!c(9:22)%in%c(10,11,12,14,17,19,20,21)])
+{
+  g1$grobs[[i]][["children"]][[3]][["children"]][[1]][["gp"]][["fill"]]<-"grey"
+}
+
+for(i in c(37:43)[!c(37:43)%in%c(37,38,43)])
+{
+  g1$grobs[[i]][["children"]][[3]][["children"]][[1]][["gp"]][["fill"]]<-"grey"
+}
+
+grid::grid.newpage()
+grid::grid.draw(g1)
+```
+
+###Mixture models
+```{r echo=FALSE,fig.width=3,fig.height=3}
+  dist_theme<-dist_theme+theme(axis.line = element_line(color = 'black',size=line_size))
+
+  #segsize
+  plotparam<-flexmix::parameters(CN_components[["segsize"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  ss<-ggplot(data = data.frame(x = c(1000,119118142)), aes(x)) + ylab("")+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    ss<-ss+stat_function(fun = dnorm, n = 1000, args = list(mean = plotparam[1,i], sd = plotparam[2,i]),color=cbPalette[i],size=line_size)
+  }
+  ss<-ss+scale_x_continuous(breaks=c(100000000))+xlab("Segment size")
+  
+  ss
+
+  #breakpoint
+  plotparam<-flexmix::parameters(CN_components[["bp10MB"]])
+  bp<-ggplot(data = data.frame(x = c(0:10)), aes(x)) + ylab("")+theme()+scale_x_continuous(breaks=c(0,4,8))+my_theme+
+    stat_function(geom="line",n=11,fun = dpois,args=list(lambda = plotparam[1]),color=cbPalette[1],size=line_size) +
+    stat_function(geom="line",n=11,fun = dpois, args=list(lambda = plotparam[2]),color=cbPalette[2],size=line_size) +
+    stat_function(geom="line",n=11,fun = dpois, args=list(lambda = plotparam[3]),color=cbPalette[3],size=line_size)+xlab("Breakpoint count per 10MB")
+  
+  bp
+
+  #oscilating
+  plotparam<-flexmix::parameters(CN_components[["osCN"]])
+  os<-ggplot(data = data.frame(x = c(0:10)), aes(x)) + ylab("")+
+    scale_x_continuous(breaks=c(0,4,8))+my_theme+
+    stat_function(geom="line",n=11,fun = dpois,args=list(lambda = plotparam[1]),color=cbPalette[1],size=line_size) +
+    stat_function(geom="line",n=11,fun = dpois, args=list(lambda = plotparam[2]),color=cbPalette[2],size=line_size) +
+    stat_function(geom="line",n=11,fun = dpois, args=list(lambda = plotparam[3]),color=cbPalette[3],size=line_size)+xlab("Length of oscilating CN segments")
+ os
+
+  #changepoint
+  plotparam<-flexmix::parameters(CN_components[["changepoint"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  cp<-ggplot(data = data.frame(x = c(0,25)), aes(x)) + ylab("")+
+  scale_x_continuous(breaks=c(4,12,22))+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    cp<-cp+stat_function(fun = dnorm, n = 1000, args = list(mean = plotparam[1,i], 
+                        sd = plotparam[2,i]),color=cbPalette[i],size=line_size)
+  }
+  
+  cp+xlab("Copy-number change point")
+
+  #copy-number
+  plotparam<-flexmix::parameters(CN_components[["copynumber"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  cn<-ggplot(data = data.frame(x = c(0,34)), aes(x)) + ylab("")+
+    scale_x_continuous(breaks=c(4,16,32))+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    cn<-cn+stat_function(fun = dnorm, n = 1000, args = list(mean = plotparam[1,i], 
+                          sd = plotparam[2,i]),color=cbPalette[i],size=line_size)
+  }
+  
+  cn+xlab("Copy-number")
+
+  #bp per chr arm
+  plotparam<-flexmix::parameters(CN_components[["bpchrarm"]])
+  ct<-ggplot(data = data.frame(x = c(0:35)), aes(x)) + ylab("")+
+    scale_x_continuous(breaks=c(0,10,30))+my_theme+
+    stat_function(geom="line",n=36,fun = dpois,args=list(lambda = plotparam[1]),color=cbPalette[1],size=line_size) +
+    stat_function(geom="line",n=36,fun = dpois, args=list(lambda = plotparam[2]),color=cbPalette[2],size=line_size) +
+    stat_function(geom="line",n=36,fun = dpois, args=list(lambda = plotparam[3]),color=cbPalette[3],size=line_size) +
+    stat_function(geom="line",n=36,fun = dpois, args=list(lambda = plotparam[4]),color=cbPalette[4],size=line_size) +
+    stat_function(geom="line",n=36,fun = dpois, args=list(lambda = plotparam[5]),color=cbPalette[5],size=line_size)+xlab("Breakpoint count per chr arm")
+  ct
+```
+
+###Shaded mixture models for signature 1
+```{r echo=FALSE,fig.width=3,fig.height=3}
+  sig_feat_mat_norm<-as.data.frame(sig_feat_mat)
+  norm_const<-apply(sig_feat_mat_norm,2,sum)
+  sig_feat_mat_norm<-data.frame(t(apply(sig_feat_mat_norm,1,function(x){x/norm_const})))
+
+  sig_weight<-as.numeric(sig_feat_mat_norm[1,])
+
+  #segsize
+  plotparam<-flexmix::parameters(CN_components[["segsize"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  shading<-sig_weight[1:10]
+  ss<-ggplot(data = data.frame(x = c(1000,119118142)), aes(x)) + ylab("")+xlab("Segment size")+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    ss<-ss+geom_area(stat = "function", fun = dnorm, args = list(mean = plotparam[1,i], 
+          sd = plotparam[2,i]),color="grey",size=0.05,fill=cbPalette[i],alpha=shading[i])
+  }
+  ss<-ss+scale_x_continuous(breaks=c(100000000))+coord_cartesian(ylim=c(0,5e-08))+xlab("Segment size")
+  
+  print(ss)
+
+  #breakpoint
+  plotparam<-flexmix::parameters(CN_components[["bp10MB"]])
+  plotparam<-plotparam[order(plotparam)]
+  shading<-sig_weight[11:13]
+  bp<-ggplot(data = data.frame(x = c(0:10)), aes(x)) + ylab("")+xlab("Number breakpoint per 10MB")+my_theme+scale_x_continuous(breaks=c(0,4,8))+
+    stat_function(geom="area",n=11,fun = dpois,args=list(lambda = plotparam[1]),
+              color="black",size=0.05,fill=cbPalette[1],alpha=shading[1]) +
+    stat_function(geom="area",n=11,fun = dpois,args=list(lambda = plotparam[2]),
+              color="black",size=0.05,fill=cbPalette[2],alpha=shading[2]) +
+    stat_function(geom="area",n=11,fun = dpois,args=list(lambda = plotparam[3]),
+              color="black",size=0.05,fill=cbPalette[3],alpha=shading[3])+xlab("Breakpoint per 10MB")
+  
+  print(bp)
+
+  #oscilating
+  plotparam<-flexmix::parameters(CN_components[["osCN"]])
+  plotparam<-plotparam[order(plotparam)]
+
+  shading<-sig_weight[14:16]
+  os<-ggplot(data = data.frame(x = c(0:10)), aes(x)) + ylab("")+xlab("Length of oscilating CN segments")+
+    scale_x_continuous(breaks=c(0,4,8))+my_theme+
+    stat_function(geom="area",n=11,fun = dpois,args=list(lambda = plotparam[1]),
+                  color="black",size=0.05,fill=cbPalette[1],alpha=shading[1]) +
+    stat_function(geom="area",n=11,fun = dpois, args=list(lambda = plotparam[2]),
+                  color="black",size=0.05,fill=cbPalette[2],alpha=shading[2]) +
+    stat_function(geom="area",n=11,fun = dpois, args=list(lambda = plotparam[3]),
+                  color="black",size=0.05,fill=cbPalette[3],alpha=shading[3])+xlab("Oscilating CN segments")
+  print(os)
+
+  #changepoint
+  plotparam<-flexmix::parameters(CN_components[["changepoint"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  shading<-sig_weight[17:23]
+  cp<-ggplot(data = data.frame(x = c(0,25)), aes(x)) + ylab("")+xlab("Copy-number change point")+
+    scale_x_continuous(breaks=c(4,12,22))+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    cp<-cp+geom_area(stat = "function", fun = dnorm, args = list(mean = plotparam[1,i], 
+          sd = plotparam[2,i]),color="black",size=0.05,fill=cbPalette[i],alpha=shading[i])
+  }
+  
+  print(cp+xlab("CN changepoint"))
+
+  #copy-number
+  plotparam<-flexmix::parameters(CN_components[["copynumber"]])
+  plotparam<-plotparam[,order(plotparam[1,])]
+  shading<-sig_weight[24:31]
+  cn<-ggplot(data = data.frame(x = c(0,34)), aes(x)) + ylab("")+xlab("Copy-number")+
+    scale_x_continuous(breaks=c(4,16,32))+my_theme
+  for(i in 1:ncol(plotparam))
+  {
+    cn<-cn+geom_area(stat = "function", fun = dnorm, args = list(mean = plotparam[1,i], 
+          sd = plotparam[2,i]),color="black",size=0.05,fill=cbPalette[i],alpha=shading[i])
+  }
+  
+  print(cn+xlab("Copy-number"))
+
+  #chr arm breaks
+  plotparam<-flexmix::parameters(CN_components[["bpchrarm"]])
+  plotparam<-plotparam[order(plotparam)]
+  shading<-sig_weight[32:36]
+  ct<-ggplot(data = data.frame(x = c(0:35)), aes(x)) + ylab("")+xlab("Number breakpoint per chr arm")+
+    scale_x_continuous(breaks=c(0,10,30))+my_theme+
+    stat_function(geom="area",n=36,fun = dpois,args=list(lambda = plotparam[1]),
+                  color="black",size=0.05,fill=cbPalette[1],alpha=shading[1]) +
+    stat_function(geom="area",n=36,fun = dpois, args=list(lambda = plotparam[2]),
+                  color="black",size=0.05,fill=cbPalette[2],alpha=shading[2]) +
+    stat_function(geom="area",n=36,fun = dpois, args=list(lambda = plotparam[3]),
+                  color="black",size=0.05,fill=cbPalette[3],alpha=shading[3]) +
+   stat_function(geom="area",n=36,fun = dpois, args=list(lambda = plotparam[4]),
+                  color="black",size=0.05,fill=cbPalette[4],alpha=shading[4]) +
+   stat_function(geom="area",n=36,fun = dpois, args=list(lambda = plotparam[5]),
+                  color="black",size=0.05,fill=cbPalette[5],alpha=shading[5])+xlab("Breakpoint per chr arm")
+  print(ct)
+```
+
+
+###Component means and standard deviations
+
+```{r echo=FALSE}
+bp<-as.matrix(flexmix::parameters(CN_components[["bp10MB"]]))
+bp<-cbind(bp[order(bp),])
+rownames(bp)<-t(paste0("bp10MB",1:nrow(bp)))
+bp<-cbind(bp,NA)
+colnames(bp)<-c("mean","sd")
+
+os<-as.matrix(flexmix::parameters(CN_components[["osCN"]]))
+os<-cbind(os[order(os),])
+rownames(os)<-paste0("osCN",1:nrow(os))
+os<-cbind(os,NA)
+colnames(os)<-c("mean","sd")
+
+ss<-t(as.matrix(flexmix::parameters(CN_components[["segsize"]])))
+ss<-ss[order(ss[,1]),]
+rownames(ss)<-paste0("segsize",1:nrow(ss))
+cn<-t(as.matrix(flexmix::parameters(CN_components[["copynumber"]])))
+cn<-cn[order(cn[,1]),]
+rownames(cn)<-paste0("copynumber",1:nrow(cn))
+cp<-t(as.matrix(flexmix::parameters(CN_components[["changepoint"]])))
+cp<-cp[order(cp[,1]),]
+rownames(cp)<-paste0("changepoint",1:nrow(cp))
+ct<-as.matrix(flexmix::parameters(CN_components[["bpchrarm"]]))
+ct<-cbind(ct[order(ct),])
+rownames(ct)<-paste0("bpchrarm",1:nrow(ct))
+ct<-cbind(ct,NA)
+colnames(ct)<-c("mean","sd")
+
+out<-data.frame(rbind(ss,cn,cp,ct,bp,os))
+out$component<-rownames(out)
+knitr::kable(out)
+```
+
+###Exposures across cohorts
+```{r echo=TRUE}
+b<-reshape2::melt(sig_pat_mat_britroc)
+b$cohort<-"BriTROC"
+p<-reshape2::melt(sig_pat_mat_pcawg)
+p$cohort<-"PCAWG"
+t<-reshape2::melt(sig_pat_mat_tcga)
+t$cohort<-"TCGA"
+
+pdat<-rbind(b,p,t)
+colnames(pdat)<-c("Signature","Patient","Exposure","Cohort")
+pdat$Signature<-plyr::revalue(pdat$Signature,
+                            c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+signif<-ggpubr::compare_means(Exposure ~ Cohort,data=pdat,group.by = c("Signature"),
+              method="wilcox.test",p.adjust.method="BH")
+signif<-signif %>% filter(p.signif!="ns") %>% group_by(Signature) %>% filter(p.format==min(p.format))
+signif$Exposure<-1
+
+knitr::kable(signif)
+
+ggplot(pdat,aes(x=Signature,y=Exposure,fill=Cohort))+geom_boxplot(alpha=0.3)+
+  my_theme+scale_fill_manual(values = cbPalette)+coord_cartesian(ylim=c(0,1))+
+  annotate("text",x = signif$Signature,y=signif$Exposure,label=signif$p.signif)
+
+```
+

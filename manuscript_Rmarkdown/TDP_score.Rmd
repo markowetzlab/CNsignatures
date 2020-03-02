@@ -1,0 +1,88 @@
+---
+title: "Tandem Duplicator Phenotype Score Calculation"
+author: "Dilrini De Silva"
+output: html_document
+---
+
+This section describes how the Tandem Duplicator Phenotype (TDP) score was calculated for PCAWG ovarian cancer samples (OV-AU, OV-US) using the method described in Menghi F, et al. (2016) *The tandem duplicator phenotype as a distinct genomic configuration in cancer. Proc Natl Acad Sci USA 113(17):E2373–E2382*.
+
+```{r}
+suppressMessages(library(tidyr))
+suppressMessages(library(dplyr))
+
+```
+
+```{r}
+# Helper functions to count the number of tandem duplications per chromosome, normalized by chromosome length. 
+chr_size <- read.table("../data/hg19.chrom.sizes.txt", sep = "\t", as.is=T)
+colnames(chr_size) <- c("chr", "size")
+chr_size$scale <- chr_size$size/sum(as.numeric(chr_size$size))
+
+
+getTdCountPerChr <- function(filename_vec){ 
+  
+  # Returns a dataframe of no. of duplication events per chromosome 
+  # normalised by chromosome size, given a vector of filenames containing 
+  # structural variant information
+  
+  lapply (filename_vec, function(filename){
+    # dataframe to contain no. of tandem duplications per chromosome
+    td_chr_df <- cbind.data.frame(c(1:22,"X"), rep(0,23), stringsAsFactors=F) 
+    colnames(td_chr_df) <- c("chr", "TD")
+    # read in structural variant file
+    sv <- read.table(filename, header=T, sep ="\t", as.is = T)
+    dup_counts <- sv %>%
+      filter(svclass == "DUP") %>%
+      group_by(chrom1) %>%
+      summarise(n_TD=n())
+  
+    # update counts in the dataframe
+    td_chr_df$TD[match(dup_counts$chrom1,td_chr_df$chr)] <- dup_counts$n_TD  
+  
+    # parse sample name from filename and add to dataframe
+    string <- strsplit(filename,"/")[[1]][6]
+    sample_name <- strsplit(string1,"[.]")[[1]][1]
+    td_chr_df$Sample <- sample_name
+    # the normaliation/weight to apply to td count based on chromosome length
+    td_chr_df$wt <- chr_size$scale[match(td_chr_df$chr,chr_size$chr)] 
+    td_chr_df
+  }
+)
+
+}
+
+
+classifyTDP = function(df){
+  # Calculates TDP score and classifies samples into TDP or non-TDP classes. 
+  # 0.71 (from Menghi et al.) was used as the threshold for classification
+  df %>%
+    group_by(Sample) %>%
+    mutate(exp = wt*sum(TD), oe=abs(TD-exp), oesum= sum(oe)) %>%
+    mutate(TDP.score.raw = round(-oesum/sum(TD),3)) %>%
+    select(Sample, TDP.score.raw) %>% 
+    unique() %>%
+    mutate(TDP.score = TDP.score.raw+0.71) %>%
+    mutate(TDP.status = ifelse(TDP.score>0,"TDP", "NON-TDP"))
+}
+```
+
+The structural variant files from PCAWG should be placed in *restricted_data/pcawg_sv/* before running the code below.
+
+```{r, tdp_calc, eval=F}
+# Calulate TDP score from structural variant calls from PCAWG (OV-AU, OV-US) samples.
+pcawg_cohort_info <- read.table("data/pcawg_cohort_info.tsv", header=T, sep="\t", as.is = T)
+pcawg_ids <- pcawg_cohort_info$tumor_wgs_aliquot_id
+path <- "restricted_data/pcawg_sv/"
+ext <- ".pcawg_consensus_1.6.161116.somatic.sv.bedpe.gz"
+pcawg_ov_filelist  <- paste0(path, pcawg_ids, ext)
+
+# calculate TDP Score and classify samples 
+results_ov <- getTdCountPerChr(pcawg_ov_filelist)
+all_data_ov <- do.call(rbind,results_ov)
+tdp_ov <- classifyTDP(all_data_ov)
+
+write.table(tdp_ov, file = "data/pcawg_TDP_score.txt", sep="\t", quote=F, row.names = F)
+
+```
+
+

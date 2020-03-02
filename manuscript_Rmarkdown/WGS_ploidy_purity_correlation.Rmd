@@ -1,0 +1,80 @@
+---
+title: "Ploidy and purity comparison - matched deep and shallow WGS"
+author: "Dilrini De Silva"
+output: html_document
+---
+To test the performance of our absolute copy-number fiting from sWGS, we compared ploidy and purity estimates across a subset of samples with matched deepWGS. 
+The estimates for deepWGS samples were extracted from [Battenberg](https://github.com/Wedge-Oxford/battenberg) plots for those samples.
+
+```{r}
+# Read in ploidy and purity estimates obtained from Battenberg plots.
+
+deep_metrics <- read.csv("data/britroc_deepWGS_ploidy_purity_49.csv", header=T, as.is = T)
+deep_metrics$purity <- deep_metrics$purity/100
+deep_metrics <- deep_metrics %>%
+  mutate(name= sub("[0-9]+_tumor_","",x=wgs_ID)) %>%
+  dplyr::select(name,ploidy, purity) %>%
+  tidyr::gather("metric", "deep", -name)
+
+# Get ploidy for sWGS samples
+
+CN <- readRDS("data/britroc_absolute_copynumber.rds")
+Biobase::pData(CN)$ploidy <- getPloidy(CN) %>%
+  .$out
+
+shallow_metrics <- Biobase::pData(CN) %>%
+  dplyr::select(name, ploidy, purity) %>%
+  filter(name %in% deep_metrics$name) %>%
+  tidyr::gather("metric", "shallow", -name)
+
+
+# Annotate sWGS samples with star_rating
+samp_annotation_all <- read.csv("data/britroc_sample_data.csv", as.is=T)
+samp_annot <- samp_annotation_all %>% 
+  filter(IM.JBLAB_ID %in% shallow_metrics$name & Failed !="Y") %>%
+  dplyr::select(IM.JBLAB_ID , star_rating)
+
+# Combine estimates from deep and shallow WGS methods and retain 3-star samples
+metrics <- inner_join(deep_metrics, shallow_metrics, by = c("name", "metric")) %>%
+  inner_join(samp_annot,c("name" = "IM.JBLAB_ID" ) ) %>%
+  filter(star_rating ==3)
+
+# Perform correlation test of ploidy, purity in Britroc samples with dWGS and sWGS data
+correlations <- metrics %>% 
+  group_by(metric) %>%
+  do(broom::tidy(cor.test(.$deep,.$shallow)))
+```
+
+
+```{r}
+# Create dataframes for annotation and generate plot for 3-star samples.
+
+correlations$metric <- factor(correlations$metric, levels=c("ploidy", "purity"))
+
+annot_text <- correlations %>% 
+  ungroup() %>%
+  dplyr::select(metric, estimate, p.value) %>%
+  mutate(x=c(2,0.4),y.cor=c(4.5,0.9), y.pval= c(4.375, 0.87)) %>%
+  group_by(metric) %>%
+  mutate(label.cor=paste0("R^2== ",round(estimate,2)), label.pval = paste0("P== ", format(signif(p.value,1),digits=1, scientific = T)) )
+
+
+cor_plot <- metrics %>%
+  ggplot(aes(x=deep, y=shallow)) +
+  geom_point()  + 
+  geom_smooth(method = "lm") + 
+  facet_wrap(~metric, scales = "free") +
+  labs(x= "Deep WGS", y= "sWGS") +
+  theme_bw()+
+  theme(axis.text=element_text(size=5),axis.title=element_text(size=7),
+  strip.text.x = element_text(size = 7), panel.background = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+
+cor_plot + 
+  geom_text(data=annot_text, aes(label=label.cor, x=x,y=y.cor), parse = T,inherit.aes=FALSE, size=2) +
+  geom_text(data=annot_text, aes(label=label.pval, x=x,y=y.pval), parse = T,inherit.aes=FALSE, size=2)
+
+
+```
+
+These plot show high concordance between ploidy and purity estimated using sWGS and deep WGS. Only two samples showed a significantly different ploidy estimate between sWGS and deepWGS. On closer inspection of the deepWGS results both samples were deemed whole-genome duplication uncertain, meaning both ploidy solutions could have been likely.

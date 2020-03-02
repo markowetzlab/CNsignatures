@@ -1,0 +1,45 @@
+---
+title: "Copy-number signatures and mutational processes in ovarian carcinoma"
+output: 
+    html_document:
+        number_sections: false
+        theme: simplex
+        toc: true
+        toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(QDNAseq))
+suppressMessages(library(flexmix))
+suppressMessages(library(NMF))
+suppressMessages(source("../main_functions.R"))
+num_cores<-16
+```
+
+This document is compiled from an Rmarkdown file which contains all code necessary to reproduce the analysis for the accompanying manuscript ["Copy-number signatures and mutational processes in ovarian carcinoma"](https://www.biorxiv.org/content/early/2017/09/04/174201). Details on how to compile the document can be found in the  repository README: https://bitbucket.org/britroc/cnsignatures. Much of the code for signature analysis can be found in the main_functions.R and helper_functions.R files in the base directory of the repositoy. Each section below describes a different component of the analysis and all numbers and figures are generated directly from the underlying data on compilation.
+
+##Data preprocessing
+
+```{r child = 'CN_signature_identification_validation.Rmd'}
+```
+
+##Survival analysis
+
+```{r child = 'Britroc_survival_estimation.Rmd'}
+```
+
+```{r child = 'CN_signature_survival_analysis.Rmd'}
+```
+
+##Association analysis
+
+```{r child = 'CN_signature_association_analysis.Rmd'}
+```
+
+##Treatment response analysis
+```{r child = 'CN_signature_relapse_analysis.Rmd'}
+```

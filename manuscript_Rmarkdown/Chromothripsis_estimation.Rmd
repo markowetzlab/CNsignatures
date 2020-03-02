@@ -1,0 +1,111 @@
+---
+title: "Chromothrispis estimation using Shatterproof"
+author: "Dilrini De Silva"
+output: html_document
+---
+
+This section describes how the copy-number (.spc) and translocation (.spt) input files were generated from the pcawg copy-number and structural variant datasets to be used with the Shatterproof software.
+
+```{r}
+suppressMessages(library(tidyr))
+suppressMessages(library(dplyr))
+```
+
+```{r, create_input, eval=F}
+pcawg_cohort_info <- read.table("data/pcawg_cohort_info.tsv", header=T, sep="\t", as.is = T)
+pcawg_ids <- pcawg_cohort_info$tumor_wgs_aliquot_id
+path <- "restricted_data/pcawg_sv/"
+ext <- ".pcawg_consensus_1.6.161116.somatic.sv.bedpe.gz"
+pcawg_ov_filelist  <- paste0(path, pcawg_ids, ext)
+pcawg_rds_idx <- which( names(pcawg_segTabs) %in% pcawg_ids)
+
+# Column names for translocation dataframe
+spt_colnames <- c("#chr1", "start", "end", "chr2", "start", "end", "quality")
+# Column names for copy-number dataframe
+spc_colnames <- c("#chr", "start", "end", "number", "quality")
+
+for(sample_name in names(pcawg_segTabs)[pcawg_rds_idx]){
+  output_path <- paste0("shatterproof/sample_data/",sample_name,"/")
+  dir.create(output_path)
+  # read in structural variant file
+  sv_filename <- paste0(pcawg_fpath, sample_name, ext) 
+  sv <- read.table(sv_filename, header=T, sep ="\t", as.is = T)
+  
+  # translocations
+  sample_spt <- filter(sv, svclass=="TRA") %>%
+    select(chrom1,start1,end1, chrom2,start2,end2) %>%
+    mutate(quality=".", chrom1 = paste0("chr",chrom1), chrom2=paste0("chr",chrom2))
+  colnames(sample_spt) <- spt_colnames
+  write.table(sample_spt, file=paste0(output_path,sample_name,".spt"), row.names = F, quote = F, sep="\t")
+  
+  # rounded absolute CN values 
+  CN <- pcawg_segTabs[[sample_name]]
+  sample_spc <- mutate(CN, quality=".", segVal=round(as.numeric(segVal),0))
+  colnames(sample_spc) <- spc_colnames
+  write.table(sample_spc, file=paste0(output_path,sample_name,".spc"), row.names = F, quote = F, sep="\t")
+
+} 
+
+```
+
+
+Shatterproof was then run using the following perl command in the shell script *runShatterproof.sh*.
+```{perl, eval=F}
+perl -w shatterproof.pl --cnv shatterproof/sample_data/ --trans shatterproof/sample_data/  --tp53 --config ./config.pl --output shatterproof/sample_data/output/ 
+```
+
+
+The final score per detected chromothripsis-like event per sample was extracted from the *suspect_regions.yml* files using the shell script *get_final_score.sh*.
+
+```{r, high_scores}
+# Read in table of combined Shatterproof scores across all samples
+sp_scores <- read.table("data/pcawg_chromothripsis_scores.txt", as.is = T, header=T, sep="\t")
+
+# Generate a list of events above 80th, 85th, 90th and 95th percentiles of shatterproof scores
+perc_rank_scores_df <- sp_scores%>% 
+  mutate(perc_rank = round(percent_rank(score),3)) %>%
+  filter(perc_rank %in% c(0.8, 0.85, 0.9, 0.95)) %>%
+  group_by(perc_rank) %>%
+  summarise(max_score = max(round(score,3)))
+
+percentile <- perc_rank_scores_df$perc_rank*100
+threshold_vec <- perc_rank_scores_df$max_score
+
+for(i in seq_along(percentile)){
+  
+  threshold <- threshold_vec[i]
+  perc <- percentile[i]
+  
+  out <- sp_scores %>% 
+    filter(score > threshold) %>%
+    group_by(sample) %>%
+    summarise(n=n())
+  out_file <- paste0("data/pcawg_chromothripsis_counts_high_scores_", perc, ".txt")
+  
+  write.table(out, out_file, row.names = F, quote = F,sep="\t")
+}
+```
+
+A conservative threshold was set at the 95th percentile of our distribution of scores to minimise false positives. Calls with scores greater than 0.485 were used to obtain a count of chromothriptic events per sample.
+
+```{r}
+high_score_events_df <- sp_scores %>% 
+  filter(score > perc_rank_scores_df$max_score[perc_rank_scores_df$perc_rank==0.95]) %>%
+  group_by(sample) %>%
+  summarise(n_high_scores=n()) %>%
+  group_by(n_high_scores) %>%
+  summarise(n_samples=n())
+```
+
+Of 61 samples with scores above the threshold, 49 (80.3%) had 1-2 events, 11 samples (18%) had 3-6 events and 1 sample (1.6%) had 10 events.
+
+
+```{r, summary_stats}
+# Summary statistics of all calls per sample
+calls_per_sample_df <- sp_scores %>%
+  group_by(sample) %>%
+  summarise(n=n())
+
+summary_calls <- summary(calls_per_sample_df$n)
+summary_calls
+```

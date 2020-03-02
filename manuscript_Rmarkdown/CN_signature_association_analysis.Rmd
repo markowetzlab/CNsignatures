@@ -1,0 +1,1133 @@
+---
+title: "CN signature association analysis"
+author: "Geoff Macintyre"
+date: "04/07/2017"
+output: html_document
+---
+
+
+```{r, echo=FALSE}
+#read in input files and compile id lists
+sample_status<-read.table("data/britroc_sample_status.csv",sep=",",header=T,stringsAsFactors = F)
+sample_status<-sample_status[grepl("tumor",sample_status$wgs_ID),]
+britroc_ids<-sample_status[sample_status$status=="final","britroc_ID"]
+britroc_sids<-sample_status[sample_status$status=="final","wgs_ID"]
+britroc_sids<-unlist(lapply(strsplit(britroc_sids,"_"),"[[",3))
+britroc_ids<-cbind(britroc_ids,britroc_sids)
+sig_pat_mat_britroc_all<-cbind(sig_pat_mat_britroc,sig_pat_mat_remain)
+all_sig<-cbind(sig_pat_mat_tcga,sig_pat_mat_pcawg,sig_pat_mat_britroc_all[,colnames(sig_pat_mat_britroc_all)%in%britroc_ids[,2]])
+
+all_corrs<-c()#variable for storing correlations for integrated figure
+all_diff_exp<-c()#variable for storing the differential exposure calculations
+all_cor_dat<-c()
+all_cor_dat_cors<-c()
+all_cor_dat_pvals<-c()
+```
+
+###Mutated pathways and driver genes
+We combined all three cohorts to test if mutant carriers had significantly higher signature exposures compared to wild-type carriers for known cancer causing genes. 
+
+####Prepararation of driver mutation list for input into Cancer Genome Interpreter
+```{r, fig.width=8, eval=FALSE}
+library(VariantAnnotation)
+#this chunk of code is not run be default due to data restrictions. Please download the required files (see below) to execute this segment of code.
+all_mutations<-c()
+
+#TCGA cohort
+#download Mutation_Packager_Raw_Calls.Level_3.2016012800.0.0 from Broad GDAC https://gdac.broadinstitute.org/
+tcga_ids<-colnames(sig_pat_mat_tcga)
+tcga_ids_missing<-c()
+for(i in tcga_ids)
+{
+    fn<-paste0("restricted_data/gdac.broadinstitute.org_OV.Mutation_Packager_Raw_Calls.Level_3.2016012800.0.0/",
+            substr(i,1,15),".maf.txt")
+  if(file.exists(fn))
+  {
+  curr_mut<-read.table(fn,sep="\t",header=T,stringsAsFactors = F)
+  all_mutations<-rbind(all_mutations,cbind(i,curr_mut$Chromosome,curr_mut$Start_position,as.character(curr_mut$Reference_Allele),as.character(curr_mut$Tumor_Seq_Allele2)))
+  }else{
+    tcga_ids_missing<-c(tcga_ids_missing,i)
+  }
+}
+colnames(all_mutations)<-c("sample","chromosome","position","ref","alt")
+tcga_mutations<-all_mutations
+
+#PCAWG cohort
+#download the final_consensus_12oct_passonly_snv_indel.tar variant calls from PCAWG then run the following commands:
+#grep -v -E 'IGR|Silent|RNA|lincRNA|Intron|UTR|Flank|Splice' October_2016_ovary.snv_indel.maf > October_2016_ovary_deleterious.snv_indel.maf
+#grep -v IGR October_2016_ovary.snv_indel.maf | cut -f13,2,3,8,10 - |  awk '{print $5 "\t" $1 "\t" $2 "\t" $3 "\t" $4 }' - > October_2016_ovary.snv_indel.CGIformat
+pcawg_ids<-colnames(sig_pat_mat_pcawg)
+pcawg_mut_table<-read.table("restricted_data/October_2016_ovary.snv_indel.CGIformat",header=T,sep=",",stringsAsFactors=F)
+colnames(pcawg_mut_table)<-c("sample","chromosome","position","ref","alt")
+pcawg_ids_missing<-pcawg_ids[!pcawg_ids%in%pcawg_mut_table$sample]
+pcawg_mut_table<-pcawg_mut_table[pcawg_mut_table$sample%in%pcawg_ids,]
+pcawg_mut_table<-as.matrix(pcawg_mut_table)
+all_mutations<-rbind(all_mutations,pcawg_mut_table)
+pcawg_mutations<-pcawg_mut_table
+
+#BritROC cohort
+#download VCFs from xxxxxxx and put in restricted_data/SNVs directory
+isDeleterious<-function(x){
+  grepl(paste("3_prime_UTR_variant",
+"5_prime_UTR_premature_start_codon_gain_variant",
+"5_prime_UTR_variant",
+"downstream_gene_variant",
+"initiator_codon_variant",
+#"intergenic_region",
+"intragenic_variant",
+"intron_variant",
+"missense_variant",
+"missense_variant&splice_region_variant",
+"non_coding_transcript_exon_variant",
+"splice_acceptor_variant&intron_variant",
+"splice_donor_variant&intron_variant",
+"splice_region_variant",
+"splice_region_variant&intron_variant",
+"splice_region_variant&non_coding_transcript_exon_variant",
+"splice_region_variant&synonymous_variant",
+"start_lost",
+"start_lost&splice_region_variant",
+"stop_gained",
+"stop_gained&splice_region_variant",
+"stop_lost",
+"stop_lost&splice_region_variant",
+"stop_retained_variant",
+"synonymous_variant",
+"upstream_gene_variant",
+sep="|"),x)}
+isPASS<-function(x){
+  grepl("PASS",x,fixed=TRUE)}
+prefilters <- FilterRules(list(PASS=isPASS,deleterious=isDeleterious))
+
+britroc_mutations<-c()
+library(VariantAnnotation)
+for(i in 1:nrow(britroc_ids))
+{
+  study_id<-as.character(britroc_ids[i,1])
+  jblab_id<-as.character(britroc_ids[i,2])
+  filename<-paste0("restricted_data/SNVs/",study_id,".snv.filters.blacklist.vcf.gz")
+  if(file.exists(filename))
+  {
+  tabix.file <- TabixFile(filename, yieldSize=10000)
+  destination.file<-paste0("restricted_data/SNVs/",study_id,".snv.deleterious.vcf")
+  if(!file.exists(destination.file))
+  {
+    filterVcf(tabix.file,"hg19", destination.file, prefilters=prefilters, verbose=TRUE)
+  }
+  curr_vcf<-readVcf(destination.file)
+  
+  britroc_mutations<-rbind(britroc_mutations,cbind(jblab_id,as.character(seqnames(curr_vcf)),
+          as.character(start(curr_vcf)),
+          as.character(ref(curr_vcf)),
+          as.character(unlist(alt(curr_vcf)))))
+  }
+}
+all_mutations<-rbind(all_mutations,britroc_mutations)
+
+all_mutations[,2]<-paste0("chr",all_mutations[,2])
+colnames(all_mutations)<-c("sample","chr","pos","ref","alt")
+all_mutations[,3]<-as.numeric(all_mutations[,3])
+
+#calculate loss and amplification for CGI
+CGI_cancer_genes<-read.table("data/cancer_genes_upon_mutations_or_CNAs.tsv",sep="\t",stringsAsFactors = F,header=T)
+CGI_cancer_genes<-unique(CGI_cancer_genes$gene)
+
+#get gene TSS
+library(org.Hs.eg.db)
+library("TxDb.Hsapiens.UCSC.hg19.knownGene")
+loc<-TxDb.Hsapiens.UCSC.hg19.knownGene
+CGI_genemap<-select(org.Hs.eg.db, CGI_cancer_genes, c("ENTREZID","GENENAME"), "ALIAS")
+gene_locs<-select(loc,CGI_genemap$ENTREZID,c("GENEID","TXCHROM","TXSTART","TXEND"),"GENEID")
+gene_locs<-gene_locs[!duplicated(gene_locs$GENEID),]
+
+gene_coords<-c()
+for(i in CGI_cancer_genes)
+{
+  currg<-CGI_genemap[CGI_genemap$ALIAS==i,"ENTREZID"]
+  if(length(currg)==1)
+  {
+    curr_loc<-gene_locs[gene_locs$GENEID==currg,]
+  }
+  else
+  {
+    for(j in currg)
+    {
+      curr_loc<-gene_locs[gene_locs$GENEID==j,]
+      if(!is.na(curr_loc[1,2]))
+      {
+        break
+      }
+    }
+  }
+  if(!is.null(curr_loc))
+  {
+    chr<-curr_loc[1,"TXCHROM"]
+    tss<-abs(curr_loc[1,"TXSTART"])
+    tss_end<-abs(curr_loc[1,"TXEND"])
+    gene_coords<-rbind(gene_coords,as.character(c(i,chr,tss,tss_end)))
+  }
+}
+colnames(gene_coords)<-c("gene","chr","tss","tss_end")
+gene_coords<-data.frame(gene_coords,stringsAsFactors = F)
+gene_coords$chr<-substring(gene_coords$chr,4)
+gene_coords<-gene_coords[gene_coords$chr%in%c(1:22),]
+
+britroc_segTab<-c()
+britroc_segTab_remain<-c()
+
+for(i in 1:ncol(hq_CN))
+{
+  britroc_segTab[[colnames(hq_CN[,i])]]<-getSegTable(hq_CN[,i])
+}
+for(i in 1:ncol(lq_CN))
+{
+  britroc_segTab[[colnames(lq_CN[,i])]]<-getSegTable(lq_CN[,i])
+}
+for(i in 1:ncol(remain_CN))
+{
+  britroc_segTab_remain[[colnames(remain_CN[,i])]]<-getSegTable(remain_CN[,i])
+}
+all_segTabs<-c(britroc_segTab,pcawg_segTabs,tcga_segTabs,britroc_segTab_remain)
+
+cn_mat<-c()
+for(j in 1:nrow(gene_coords))
+{
+  res<-c()
+  name<-gene_coords[j,"gene"]
+  chr<-gene_coords[j,"chr"]
+  tss<-abs(as.numeric(gene_coords[j,"tss"]))
+  for(i in colnames(all_sig))
+  {
+    segTable<-all_segTabs[[i]]
+    cn<-as.numeric(segTable[segTable[,1]==chr&as.numeric(segTable[,2])<tss&as.numeric(segTable[,3])>tss,4])
+    if(!length(cn)==1)
+    {
+      modtss<-tss+1000000
+      cn<-as.numeric(segTable[segTable[,1]==chr&as.numeric(segTable[,2])<modtss&as.numeric(segTable[,3])>modtss,4])
+      if(!length(cn)==1)
+      {
+      cn<-NA
+      }
+    }
+    res<-c(res,cn)
+  }
+  cn_mat<-rbind(cn_mat,c(name,res))
+}
+colnames(cn_mat)<-c("Gene",colnames(all_sig))
+rownames(cn_mat)<-cn_mat[,1]
+cn_mat<-cn_mat[,-1]
+
+del<-apply(cn_mat,1,function(x){
+  x<-x[!is.na(x)]
+  names(x[as.numeric(x)<0.4])})
+del<-del[unlist(lapply(del,length))>0]
+
+amp<-apply(cn_mat,1,function(x){
+  x<-x[!is.na(x)]
+  names(x[as.numeric(x)>5])})
+amp<-amp[unlist(lapply(amp,length))>0]
+
+cn_forCGI<-c()
+for(i in names(del))
+{
+  cn_forCGI<-rbind(cn_forCGI,cbind(del[[i]],i,"del"))
+}
+for(i in names(amp))
+{
+  cn_forCGI<-rbind(cn_forCGI,cbind(amp[[i]],i,"amp"))
+}
+colnames(cn_forCGI)<-c("sample","gene","cna")
+write.table(cn_forCGI,"cn_for_CGI.txt",quote=F,row.names=F,sep="\t")
+
+gene_coords_gr<-gene_coords
+colnames(gene_coords_gr)<-c("gene","chr","start","end")
+gene_coords_gr$chr<-paste0("chr",gene_coords_gr$chr)
+gene_coords_gr<-makeGRangesFromDataFrame(gene_coords_gr,seqinfo = paste0("chr",c(1:22,"X","Y")))
+
+colnames(tcga_mutations)<-colnames(all_mutations)
+library(rtracklayer)
+
+tcga_mutations<-data.frame(tcga_mutations)
+coords_to_liftover<-data.frame(chr=paste0("chr",tcga_mutations$chr),start=tcga_mutations$pos,end=tcga_mutations$pos,tcga_mutations[,c(1,4,5)])
+gr<-makeGRangesFromDataFrame(coords_to_liftover,keep.extra.columns = TRUE,ignore.strand = TRUE)
+chain<-import.chain("data/hg18ToHg19.over.chain")
+gr_hg19<-liftOver(gr,chain)
+gr_hg19<-subsetByOverlaps(unlist(gr_hg19),gene_coords_gr)
+tcga_mutations_hg19<-data.frame(gr_hg19)[,c("sample","seqnames","start","ref","alt")]
+colnames(tcga_mutations_hg19)<-c("sample","chr","pos","ref","alt")
+tcga_mutations_hg19$chr<-substring(tcga_mutations_hg19$chr,4)
+write.table(tcga_mutations_hg19,"tcga_mutations_for_CGI.txt",quote=F,row.names=F,sep="\t")
+
+britroc_mutations<-data.frame(britroc_mutations)
+colnames(britroc_mutations)<-colnames(all_mutations)
+britroc_mutations_gr<-data.frame(chr=paste0("chr",britroc_mutations$chr),start=britroc_mutations$pos,end=britroc_mutations$pos,britroc_mutations[,c(1,4,5)])
+britroc_mutations_gr<-makeGRangesFromDataFrame(britroc_mutations_gr,keep.extra.columns = TRUE,ignore.strand = TRUE)
+britroc_mutations_gr<-subsetByOverlaps(unlist(britroc_mutations_gr),gene_coords_gr)
+britroc_mutations<-data.frame(britroc_mutations_gr)[,c("sample","seqnames","start","ref","alt")]
+colnames(britroc_mutations)<-c("sample","chr","pos","ref","alt")
+britroc_mutations$chr<-substring(britroc_mutations$chr,4)
+write.table(britroc_mutations,"britroc_mutations_for_CGI.txt",quote=F,row.names=F,sep="\t")
+
+pcawg_mutations<-data.frame(pcawg_mutations)
+colnames(pcawg_mutations)<-colnames(all_mutations)
+pcawg_mutations_gr<-data.frame(chr=paste0("chr",pcawg_mutations$chr),start=pcawg_mutations$pos,end=pcawg_mutations$pos,pcawg_mutations[,c(1,4,5)])
+pcawg_mutations_gr<-makeGRangesFromDataFrame(pcawg_mutations_gr,keep.extra.columns = TRUE,ignore.strand = TRUE)
+pcawg_mutations_gr<-subsetByOverlaps(unlist(pcawg_mutations_gr),gene_coords_gr)
+pcawg_mutations<-data.frame(pcawg_mutations_gr)[,c("sample","seqnames","start","ref","alt")]
+colnames(pcawg_mutations)<-c("sample","chr","pos","ref","alt")
+pcawg_mutations$chr<-substring(pcawg_mutations$chr,4)
+write.table(pcawg_mutations,"pcawg_mutations_for_CGI.txt",quote=F,row.names=F,sep="\t")
+```
+
+To run the [Cancer Genome Interpreter](https://cancergenomeinterpreter.org/) analysis use the python script launch_CGI.py located in the scripts directory.
+
+####Extraction of pathway list from Reactome enriched for mutated drivers 
+```{r,echo=T,eval=FALSE}
+#after the above analysis is complete, results should be downloaded into the following directories:
+#PCAWG:restricted_data/pcawg/
+#TCGA:restricted_data/tcga/
+#BRITROC:restricted_data/britroc/
+#CNAs:resticted_data/cnas
+CGImuts_pcawg<-read.table("restricted_data/pcawg/mutation_analysis.tsv",header=T,sep="\t",stringsAsFactors = F)
+CGImuts_tcga<-read.table("restricted_data/tcga/mutation_analysis.tsv",header=T,sep="\t",stringsAsFactors = F)
+CGImuts_britroc<-read.table("restricted_data/britroc/mutation_analysis.tsv",header=T,sep="\t",stringsAsFactors = F)
+CGImuts<-rbind(CGImuts_britroc,CGImuts_pcawg,CGImuts_tcga)
+CGImuts<-CGImuts[CGImuts$driver_mut_prediction%in%c("TIER 1","TIER 2"),]
+write.table(CGImuts,"mutated_cases.tsv",row.names = F,sep="\t")
+
+CGIcna<-read.table("restricted_data/cnas/cna_analysis.tsv",header=T,sep="\t",stringsAsFactors = F)
+CGIcna<-CGIcna[!CGIcna$driver_statement%in%c("predicted passenger"),]
+write.table(CGIcna,"del_amp_cases.tsv",row.names = F,sep="\t")
+
+CGIcna<-CGIcna[CGIcna$sample%in%all_mutations[,1],]
+
+all_mut<-list()
+for(i in unique(CGImuts$sample))
+{
+  all_mut[[i]]<-CGImuts[CGImuts$sample==i,"gene"]
+}
+for(i in unique(CGIcna$sample))
+{
+  if(is.null(all_mut[[i]]))
+  {
+    all_mut[[i]]<-CGIcna[CGIcna$sample==i,"gene"]
+  }
+  else
+  {
+    all_mut[[i]]<-c(all_mut[[i]],CGIcna[CGIcna$sample==i,"gene"])
+  }
+}
+all_mut<-all_mut[names(all_mut)%in%colnames(all_sig)]
+
+#contruct mutation matrix
+all_genes<-unique(as.character(unlist(all_mut)))
+all_genes<-all_genes[!is.na(all_genes)]
+
+library(ReactomePA)
+library(org.Hs.eg.db)
+genemap<-AnnotationDbi::select(org.Hs.eg.db, all_genes, c("ENTREZID","GENENAME"), "ALIAS")
+genemap<-genemap[!duplicated(genemap$ALIAS),]
+x <- enrichPathway(gene=genemap$ENTREZID,pvalueCutoff=0.05,qvalueCutoff=0.05,readable = T)
+enriched_pathways<-x
+x<-as.data.frame(x)
+x<-x[x$Count>=5,]
+
+pathway_genes<-list()
+for(i in 1:nrow(x))
+{
+  gene_ratio<-as.numeric(unlist(strsplit(x[i,]$GeneRatio,"/")))
+  bg_ratio<-as.numeric(unlist(strsplit(x[i,]$BgRatio,"/")))
+  if((gene_ratio[1]/bg_ratio[1])>0.05)
+  {
+    pathway_genes[[x[i,]$ID]]<-unlist(strsplit(x[i,]$geneID,"/"))
+  }
+}
+all_genes<-all_genes[all_genes%in%unique(unlist(pathway_genes))]
+all_genes<-all_genes[!all_genes=="TP53"]
+
+mut_matrix<-c()
+for(g in all_genes)
+{
+  mut_matrix<-cbind(mut_matrix,unlist(lapply(all_mut,function(x){sum(x%in%g)>0})))
+}
+colnames(mut_matrix)<-all_genes
+mut_matrix<-mut_matrix[,colSums(mut_matrix)>=1]
+mut_matrix<-data.frame(mut_matrix)
+all_sequenced_patients<-unique(all_mutations[,1])
+samples_to_add<-all_sequenced_patients[!all_sequenced_patients%in%rownames(mut_matrix)]
+unmut<-rep(FALSE,length(samples_to_add)*ncol(mut_matrix))
+dim(unmut)<-c(length(samples_to_add),ncol(mut_matrix))
+rownames(unmut)<-samples_to_add
+colnames(unmut)<-colnames(mut_matrix)
+mut_matrix<-rbind(mut_matrix,unmut)
+mut_matrix<-mut_matrix[rownames(mut_matrix)%in%colnames(all_sig),]
+
+#request the following files from the DACO for this project: HRstatus.csv and somaticHRD.csv
+HRmuts<-read.table("restricted_data/HRstatus.csv",header=T,stringsAsFactors = F,sep=",")
+HRmuts$Gene[is.na(HRmuts$Gene)]<-"WT"
+BRCA1_mutants<-britroc_ids[britroc_ids[,1]%in%HRmuts$BritRoc.No[HRmuts$Gene=="BRCA1"],2]
+BRCA2_mutants<-britroc_ids[britroc_ids[,1]%in%HRmuts$BritRoc.No[HRmuts$Gene=="BRCA2"],2]
+somaticBRCA<-read.table("restricted_data/somaticHRD.csv",header=T,stringsAsFactors = F,sep=",")
+BRCA1_mutants<-c(BRCA1_mutants,britroc_ids[britroc_ids[,2]%in%somaticBRCA[somaticBRCA$Symbol..Gene.ID.=="BRCA1","Sample"],2])
+BRCA2_mutants<-c(BRCA2_mutants,britroc_ids[britroc_ids[,2]%in%somaticBRCA[somaticBRCA$Symbol..Gene.ID.=="BRCA2","Sample"],2])
+mut_matrix[rownames(mut_matrix)%in%BRCA1_mutants,"BRCA1"]<-TRUE
+mut_matrix[rownames(mut_matrix)%in%BRCA2_mutants,"BRCA2"]<-TRUE
+
+#get germline BRCA mutations for TCGA
+BRCA1<-c("TCGA-10-0931",
+         "TCGA-13-1408","TCGA-23-102","TCGA-23-1118","TCGA-23-2078","TCGA-23-2079","TCGA-13-0887",
+         "TCGA-13-1494","TCGA-13-0893","TCGA-13-0903","TCGA-61-2109","TCGA-04-1356","TCGA-59-2348",
+         "TCGA-13-1512","TCGA-09-1669","TCGA-25-2392","TCGA-24-2298","TCGA-24-1470","TCGA-57-1582",
+         "TCGA-09-2051","TCGA-13-0883","TCGA-23-1122","TCGA-23-2077","TCGA-23-2081","TCGA-25-2401",
+         "TCGA-09-2045","TCGA-61-2008")
+
+BRCA2<-c("TCGA-24-0975","TCGA-24-2288","TCGA-13-0900","TCGA-04-1367","TCGA-25-2404","TCGA-24-1463",
+         "TCGA-24-1417","TCGA-24-2024","TCGA-04-1336","TCGA-13-0913","TCGA-13-0886","TCGA-13-1498",
+         "TCGA-13-1499","TCGA-24-2280","TCGA-59-2351","TCGA-13-0726","TCGA-24-2293","TCGA-24-1562",
+         "TCGA-13-1512","TCGA-23-1026")
+mut_matrix[substring(rownames(mut_matrix),1,12)%in%BRCA1,"BRCA1"]<-TRUE
+mut_matrix[substring(rownames(mut_matrix),1,12)%in%BRCA2,"BRCA2"]<-TRUE
+
+saveRDS(mut_matrix,"data/mutation_matrix.rds")
+saveRDS(pathway_genes,"data/pathway_genes.rds")
+saveRDS(enriched_pathways,"data/enriched_pathways.rds")
+saveRDS(CGImuts[,c("sample","gene","consequence","gene_role")],"data/CGI_mut_role.rds")
+saveRDS(CGIcna[,c("sample","gene","cna","gene_role")],"data/CGI_cna_role.rds")
+
+```
+
+####Changes in exposures between cases with mutated pathways versus non-mutated
+```{r}
+mut_matrix<-readRDS("data/mutation_matrix.rds")
+pathway_genes<-readRDS("data/pathway_genes.rds")
+enriched_pathways<-readRDS("data/enriched_pathways.rds")
+
+min_cases_mutated<-24
+min_cases_top_two_genes<-5
+pathway_mut_matrix<-c()
+remove_pathway<-c()
+matrix_pathways<-c()
+pathway_mutated_genecount<-list()
+all_exposures_mut_wt<-c()
+for(p in names(pathway_genes))
+{
+  curr_genes<-pathway_genes[[p]]
+  curr_mut_matrix<-as.matrix(mut_matrix[,colnames(mut_matrix)%in%curr_genes])
+  if(sum(rowSums(curr_mut_matrix)>0)>=min_cases_mutated&sum(colSums(curr_mut_matrix)>=min_cases_top_two_genes)>=0)
+  {
+  if(ncol(curr_mut_matrix)>1)
+  {
+    pathway_mut_matrix<-cbind(pathway_mut_matrix,rowSums(curr_mut_matrix)>0)
+    matrix_pathways<-c(matrix_pathways,p)
+    pathway_mutated_genecount[[p]]<-colSums(curr_mut_matrix)
+  }else if(sum(colnames(mut_matrix)%in%curr_genes)==0){
+    remove_pathway<-c(remove_pathway,p)
+  }else{
+    pathway_mut_matrix<-cbind(pathway_mut_matrix,curr_mut_matrix[,1])
+    matrix_pathways<-c(matrix_pathways,p)
+    pathway_mutated_genecount[[p]]<-sum(curr_mut_matrix)
+  }
+  }
+}
+colnames(pathway_mut_matrix)<-matrix_pathways
+mut_ratio_info<-c()
+for(g in colnames(pathway_mut_matrix))
+{
+  mutated<-pathway_mut_matrix[,g]
+  for(s in rownames(all_sig))
+  {
+    mut<-as.numeric(all_sig[s,rownames(pathway_mut_matrix)[mutated]])
+    nonmut<-as.numeric(all_sig[s,rownames(pathway_mut_matrix)[!mutated]])
+    all_exposures_mut_wt<-rbind(all_exposures_mut_wt,rbind(cbind(s,g,"mut",mut),cbind(s,g,"wt",nonmut)))
+    if(median(mut)>median(nonmut))
+    {
+    mut_ratio_info<-rbind(mut_ratio_info,c(g,s,median(mut)-median(nonmut),wilcox.test(mut,nonmut,alternative="greater")$p.value))
+    }
+  }
+}
+colnames(mut_ratio_info)<-c("Type","Signature","mean_diff","pvalue")
+mut_ratio_info<-data.frame(mut_ratio_info,stringsAsFactors=F)
+
+mut_ratio_info<-mut_ratio_info[abs(as.numeric(mut_ratio_info$mean_diff))>=0.10,]
+mut_ratio_info$qvalue<-p.adjust(mut_ratio_info[,4],method="BH")
+mut_ratio_info$Description<-enriched_pathways[mut_ratio_info$Type,"Description"]
+mut_ratio_info$Signature<-factor(mut_ratio_info$Signature,levels=paste0("s",1:nsig))
+mut_ratio_info$Signature<-plyr::revalue(mut_ratio_info$Signature,
+                         c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+mut_ratio_info<-mut_ratio_info[mut_ratio_info$qvalue<0.005,]
+mut_ratio_info<-merge(mut_ratio_info,enriched_pathways[,c("ID","geneID")],by.x=1,by.y=1)
+mut_ratio_info<-mut_ratio_info[order(mut_ratio_info$Signature,mut_ratio_info$qvalue),]
+
+colnames(all_exposures_mut_wt)<-c("Signature","ID","Status","Exposure")
+all_exposures_mut_wt<-data.frame(all_exposures_mut_wt,stringsAsFactors = F)
+all_exposures_mut_wt$Description<-enriched_pathways[all_exposures_mut_wt$ID,"Description"]
+knitr::kable(mut_ratio_info[,1:6],"html") %>%
+    kableExtra::kable_styling(full_width=F) %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
+```
+
+####Changes in exposures between cases with single driver gene mutations versus non-mutated
+```{r}
+driver_genes<-c("NF1","RB1","BRCA1","BRCA2","CDK12","CCNE1","PTEN","MYC","PIK3CA")
+d_mut_ratio_info<-c()
+all_exposures_mut_wt_gene<-c()
+for(g in driver_genes)
+{
+  mutated<-mut_matrix[,g]
+  for(s in rownames(all_sig))
+  {
+    mut<-as.numeric(all_sig[s,rownames(mut_matrix)[mutated]])
+    nonmut<-as.numeric(all_sig[s,rownames(mut_matrix)[!mutated]])
+    all_exposures_mut_wt_gene<-rbind(all_exposures_mut_wt_gene,rbind(cbind(s,g,"mut",mut),cbind(s,g,"wt",nonmut)))
+
+    if(median(mut)>median(nonmut))
+    {
+    d_mut_ratio_info<-rbind(d_mut_ratio_info,c(g,s,median(mut)-median(nonmut),wilcox.test(mut,nonmut,alternative="greater")$p.value))
+    }
+  }
+}
+colnames(d_mut_ratio_info)<-c("Gene","Signature","median_diff","pvalue")
+d_mut_ratio_info<-data.frame(d_mut_ratio_info,stringsAsFactors = F)
+d_mut_ratio_info<-d_mut_ratio_info[d_mut_ratio_info$median_diff>=0.07,]
+d_mut_ratio_info$adj.pvalue<-p.adjust(d_mut_ratio_info$pvalue)
+d_mut_ratio_info<-d_mut_ratio_info[d_mut_ratio_info$adj.pvalue<=0.05,]
+knitr::kable(d_mut_ratio_info) %>%
+  kableExtra::kable_styling() %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
+```
+
+
+####Manual selection of representative pathways showing differential exposures
+```{r, warning=F,fig.height=8}
+selected_path<-read.table("data/pathway_results_filtered.csv",header = T,sep="\t",stringsAsFactors = F)
+selected_pathways<-mut_ratio_info[mut_ratio_info$Type%in%selected_path$Type,c(1,6,2,3,4,5,7)]
+
+CGImuts<-readRDS("data/CGI_mut_role.rds")
+CGIcna<-readRDS("data/CGI_cna_role.rds")
+
+#manual summary results
+gene_roles<-c()
+for(i in 1:nrow(selected_pathways))
+{
+mut<-CGImuts[CGImuts$gene%in%unlist(strsplit(selected_pathways[i,"geneID"],"/")),]
+cna<-CGIcna[CGIcna$gene%in%unlist(strsplit(selected_pathways[i,"geneID"],"/")),]
+gene_roles<-rbind(gene_roles,cbind(selected_pathways[i,c(1:2)],mut))
+if(nrow(cna)>1)
+{
+  colnames(cna)<-colnames(mut)
+  gene_roles<-rbind(gene_roles,cbind(selected_pathways[i,c(1:2)],cna))
+}
+}
+gene_roles<-gene_roles[order(gene_roles[,1],gene_roles[,2],gene_roles[,4]),]
+all_diff_exp<-selected_pathways
+
+#generate pathway mutation plots
+pdat<-c()
+for(p in unique(selected_pathways$Type))
+{
+  desc<-unique(selected_pathways[selected_pathways$Type==p,"Description"])
+  curr_genes<-pathway_genes[[p]]
+  for(g in curr_genes)
+  {
+    m<-CGImuts[CGImuts$gene==g,c("sample","gene","consequence")]
+    m<-m[!duplicated(m$sample),]
+    c<-CGIcna[CGIcna$gene==g,c("sample","gene","cna")]
+    c<-c[!duplicated(c$sample),]
+    colnames(c)<-c("sample","gene","consequence")
+    if(nrow(m)>0)
+    {
+      pdat<-rbind(pdat,cbind(desc,m))
+    }
+    if(nrow(c)>0)
+    {
+      pdat<-rbind(pdat,cbind(desc,c))
+    }
+  }
+}
+pdat<-pdat[!pdat$gene=="TP53",]  
+
+ord<-pdat %>% group_by(gene) %>% summarise(count=n()) %>% arrange(count)
+
+pdat$gene<-factor(pdat$gene,levels=ord$gene)
+
+ggplot(pdat,aes(x=gene,fill=consequence))+
+  geom_bar(stat="count",position = "stack")+
+  facet_grid(desc ~ .,scales="free",space="free")+
+  coord_flip()+my_theme+theme(strip.text.y = element_text(angle = 0),axis.text.y=element_text(face="italic"))+scale_fill_manual(values=cbPalette)+xlab("Driver genes")+ylab("Mutated cases")
+
+mut_path_count<-reshape2::melt(table(pdat[,c(1,3)]))
+mut_path_count<-mut_path_count[mut_path_count$value>0,]
+```
+
+####Visualising differences in exposures
+```{r}
+pdat<-all_exposures_mut_wt[all_exposures_mut_wt$Description%in%selected_pathways$Description,]
+pdat$highlight<-FALSE
+
+pdat$highlight[pdat$Signature%in%c("s4","s6")&pdat$Description=="PI3K/AKT Signaling in Cancer"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s4","s6")&pdat$Description=="Toll Like Receptor 3 (TLR3) Cascade"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s7")&pdat$Description=="Signaling by Wnt"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s1")&pdat$Description=="Regulation of RAS by GAPs"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s4","s7")&pdat$Description=="Interleukin-4 and 13 signaling"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s6")&pdat$Description=="Cyclin E associated events during G1/S transition "]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s6")&pdat$Description=="Cellular Senescence"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s3")&pdat$Description=="HDR through Homologous Recombination (HRR)"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s6")&pdat$Description=="Cyclin D associated events in G1"]<-TRUE
+
+pdat$Description<-plyr::revalue(pdat$Description,c(
+                       "PI3K/AKT Signaling in Cancer"="PI3K/AKT\nsignaling",
+                       "Cyclin E associated events during G1/S transition "="Cyclin E\nevents\nin G1/S",
+                       "Interleukin-4 and 13 signaling"="Interleukin-4\nand 13\nsignaling",
+                       "Regulation of RAS by GAPs"="RAS\nsignaling",
+                       "Signaling by Wnt"="Wnt\nsignaling",
+                       "Cyclin D associated events in G1"="Cyclin D\nevents in G1",
+                       "Toll Like Receptor 3 (TLR3) Cascade"="Toll-Like\nReceptors\nCascades",
+                       "HDR through Homologous Recombination (HRR)"="Homologous\nrecombination"))
+
+
+
+
+pdat$Signature<-plyr::revalue(pdat$Signature,
+                         c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+p<-ggplot(pdat,aes(x=Status,y=as.numeric(Exposure)))+
+   geom_rect(data = pdat,aes(fill = highlight==TRUE),xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.1)+
+  geom_boxplot(outlier.size = 0.5,outlier.alpha = 0.3,varwidth = T,lwd=0.25)+facet_grid(Signature~Description)+
+  theme_bw()+theme(axis.text=element_text(size=6),axis.title=element_text(size=6),legend.position = "none",
+  strip.text = element_text(size = 5))+ylab("Exposure")+coord_cartesian(ylim=c(0,0.7))+
+  scale_fill_manual(values=c("white","grey"))
+p
+```
+
+
+```{r}
+pdat<-data.frame(all_exposures_mut_wt_gene,stringsAsFactors = F)
+colnames(pdat)<-c("Signature","Gene","Status","Exposure")
+pdat$highlight<-FALSE
+
+pdat$highlight[pdat$Signature%in%c("s1")&pdat$Gene=="NF1"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s3")&pdat$Gene=="BRCA1"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s3")&pdat$Gene=="BRCA2"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s2","s4")&pdat$Gene=="CDK12"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s4","s6")&pdat$Gene=="CCNE1"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s4","s7")&pdat$Gene=="MYC"]<-TRUE
+pdat$highlight[pdat$Signature%in%c("s3")&pdat$Gene=="PTEN"]<-TRUE
+
+
+p<-ggplot(pdat,aes(x=Status,y=as.numeric(Exposure)))+
+   geom_rect(data = pdat,aes(fill = highlight==TRUE),xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.1)+
+  geom_boxplot(outlier.size = 0.5,outlier.alpha = 0.3,varwidth = T,lwd=0.25)+facet_grid(Signature~Gene)+
+  theme_bw()+theme(axis.text=element_text(size=6),axis.title=element_text(size=6),legend.position = "none",
+  strip.text = element_text(size = 5),strip.text.x=element_text(face="italic"))+ylab("Exposure")+#coord_cartesian(ylim=c(0,0.7))+
+  scale_fill_manual(values=c("white","grey"))
+p
+```
+
+###SNV signatures
+
+```{r child = 'Mutational_signatures.Rmd'}
+```
+
+####Correlation between SNV and CN signature exposures
+```{r echo=TRUE, cache=T, fig.width=16}
+pcawg_cosmic_weights = read.table(file = "data/pcawg_cosmic_weights.txt",as.is = T, header=T,row.names = 1)
+britroc_cosmic_weights = read.table(file = "data/britroc_cosmic_weights.txt",as.is = T, header=T,row.names = 1)
+
+rownames(britroc_cosmic_weights)<-unlist(lapply(strsplit(rownames(britroc_cosmic_weights),"_"),"[[",3))
+
+cosmic_weights<-rbind(pcawg_cosmic_weights,britroc_cosmic_weights)
+
+cosmic_weights<-cosmic_weights[,colSums(cosmic_weights)>0]
+
+SNV_sig<-cosmic_weights[rownames(cosmic_weights)%in%colnames(cbind(sig_pat_mat_britroc,sig_pat_mat_remain,sig_pat_mat_pcawg)),]
+SNV_sig<-SNV_sig[,-ncol(SNV_sig)]#Remove unknown signature component
+CN_sig<-cbind(sig_pat_mat_britroc,sig_pat_mat_remain,sig_pat_mat_pcawg)
+CN_sig<-CN_sig[,colnames(CN_sig)%in%rownames(SNV_sig)]
+CN_sig<-t(CN_sig)
+CN_sig<-CN_sig[match(rownames(SNV_sig),rownames(CN_sig)),]
+
+library(Hmisc)
+SNV_CN_sig_cor<-rcorr(as.matrix(SNV_sig),as.matrix(CN_sig),type="pearson")
+library(corrplot)
+cormat<-SNV_CN_sig_cor$r[c(-22:-28),c(22:28)]
+pval<-SNV_CN_sig_cor$P[c(-22:-28),c(22:28)]
+qval<-p.adjust(SNV_CN_sig_cor$P[c(-22:-28),c(22:28)],method="BH")
+dim(qval)<-dim(SNV_CN_sig_cor$P[c(-22:-28),c(22:28)])
+rownames(qval)<-rownames(SNV_CN_sig_cor$P[c(-22:-28),c(22:28)])
+colnames(qval)<-colnames(SNV_CN_sig_cor$P[c(-22:-28),c(22:28)])
+#cormat[qval>=0.1]<-0
+colnames(cormat)<-1:nsig
+colnames(pval)<-1:nsig
+colnames(qval)<-1:nsig
+integrated_matrix<-cbind(reshape2::melt(cormat),reshape2::melt(pval)[,3],reshape2::melt(qval)[,3])
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-integrated_matrix[integrated_matrix$qvalue<0.05&abs(integrated_matrix$Correlation)>0.25&!is.na(integrated_matrix$qvalue<0.05),]
+
+colnames(CN_sig)<-1:nsig
+for(i in paste0("Signature.",c(1,3,5,13,16)))
+{
+  for(s in 1:nsig)
+  {
+  all_cor_dat<-rbind(all_cor_dat,cbind(i,s,CN_sig[,s],SNV_sig[,i]))
+  all_cor_dat_cors<-rbind(all_cor_dat_cors,c(Signature=s,cor=cormat[i,s],Feature=i))
+  all_cor_dat_pvals<-rbind(all_cor_dat_pvals,c(Signature=s,pval=qval[i,s],Feature=i))
+  }
+}
+rownames(all_cor_dat)<-NULL
+all_cor_dat_cors<-data.frame(all_cor_dat_cors,stringsAsFactors = F)
+all_cor_dat_pvals<-data.frame(all_cor_dat_pvals,stringsAsFactors = F)
+knitr::kable(all_corrs) %>%
+    kableExtra::kable_styling(full_width = T)
+```
+
+###Tandem-duplicator phenotype score
+####Tandem Duplicator Phenotype Score Calculation
+```{r child = 'TDP_score.Rmd'}
+```
+####Correlation between TDP score and CN signature exposures
+```{r fig.height=3}
+TDPscores<-read.table("data/pcawg_TDP_score.txt",header=T,sep="\t",stringsAsFactors = F)
+TDPscores<-TDPscores[TDPscores$Sample%in%colnames(sig_pat_mat_pcawg),]
+
+pdat<-reshape2::melt(sig_pat_mat_pcawg)
+colnames(pdat)<-c("Signature","ID","Exposure")
+pdat<-merge(pdat,TDPscores,by.x=2,by.y=1)
+
+cors <- plyr::ddply(pdat, c("Signature"), summarise, cor = cor.test(Exposure, TDP.score,method="s",exact=F)$estimate)
+pvals <- plyr::ddply(pdat, c("Signature"), summarise, pval = cor.test(Exposure, TDP.score,method="s",exact=F)$p.value)
+cors$Signature<-as.character(1:nsig)
+pvals$Signature<-as.character(1:nsig)
+cors$Feature<-"TDP score"
+pvals$Feature<-"TDP score"
+
+integrated_matrix<-cbind("Tandem duplicator phenotype score",cors[,1:2],pvals[,2],p.adjust(pvals[,2],method="BH"))
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-rbind(all_corrs,integrated_matrix[integrated_matrix$qvalue<0.05&abs(integrated_matrix$Correlation)>0.25&!is.na(integrated_matrix$qvalue<0.05),])
+
+pdat$Signature<-plyr::revalue(pdat$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+p<-ggplot(pdat,aes(x=Exposure,y=as.numeric(TDP.score)))+geom_point(size=0.1)+geom_smooth(method = lm)+facet_wrap(~Signature,ncol = 8,scales="free_x")+
+  coord_cartesian(ylim = c(-1.2,1.2))+
+  geom_text(size=2,data=cors, aes(label=paste0("r== ", round(cor,2))),x=0.1, y=0.9, hjust=-0.05, vjust=0,parse = T)+
+    geom_text(size=2,data=pvals, aes(label=paste0("p== ", round(pval,4))), x=0.1, y=0.55, hjust=-0.05, vjust=0,parse=T)+ ylab("")+theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=7),
+  strip.text.x = element_text(size = 7))
+p
+
+pvals$pval<-p.adjust(pvals$pval,method="BH")
+
+all_cor_dat<-rbind(all_cor_dat,cbind("TDP score",pdat$Signature,pdat$Exposure,pdat$TDP.score))
+all_cor_dat_cors<-rbind(all_cor_dat_cors,cors)
+all_cor_dat_pvals<-rbind(all_cor_dat_pvals,pvals)
+
+```
+
+###Chromothripsis
+####Chromothrispis estimation using Shatterproof
+
+```{r child = 'Chromothripsis_estimation.Rmd'}
+```
+####Correlation between Shatterproof scores and CN signature exposures
+```{r fig.height=3}
+CHRPscores<-read.table("data/pcawg_chromothripsis_counts_high_scores_95.txt",header=T,sep="\t",stringsAsFactors = F)
+CHRPscores<-CHRPscores[CHRPscores$sample%in%colnames(sig_pat_mat_pcawg),]
+
+pdat<-reshape2::melt(sig_pat_mat_pcawg)
+colnames(pdat)<-c("Signature","ID","Exposure")
+pdat<-merge(pdat,CHRPscores,by.x=2,by.y=1)
+
+pdat<-pdat[pdat$n>0,]
+
+cors <- plyr::ddply(pdat, c("Signature"), summarise, cor = cor.test(Exposure, n,method="p",exact=F)$estimate)
+pvals <- plyr::ddply(pdat, c("Signature"), summarise, pval = cor.test(Exposure, n,method="p",exact=F)$p.value)
+cors$Signature<-as.character(1:nsig)
+pvals$Signature<-as.character(1:nsig)
+cors$Feature<-"Shatterproof score"
+pvals$Feature<-"Shatterproof score"
+
+integrated_matrix<-cbind("Shatterproof score",cors[,1:2],pvals[,2],p.adjust(pvals[,2],method="BH"))
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-rbind(all_corrs,integrated_matrix[integrated_matrix$qvalue<0.05&abs(integrated_matrix$Correlation)>0.25&!is.na(integrated_matrix$qvalue<0.05),])
+
+pdat$Signature<-plyr::revalue(pdat$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+p<-ggplot(pdat,aes(x=Exposure,y=as.numeric(n)))+geom_point(size=0.1)+geom_smooth(method = lm)+facet_wrap(~Signature,ncol = 8,scales="free_x")+
+  coord_cartesian(ylim = c(0,10))+
+  geom_text(size=2,data=cors, aes(label=paste0("r== ", round(cor,2))),x=0.1, y=7.5, hjust=-0.05, vjust=0,parse = T)+
+    geom_text(size=2,data=pvals, aes(label=paste0("p== ", round(pval,4))), x=0.1, y=8.5, hjust=-0.05, vjust=0,parse=T)+ ylab("")+theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=7),
+  strip.text.x = element_text(size = 7))
+p
+
+all_cor_dat<-rbind(all_cor_dat,cbind("Shatterproof score",pdat$Signature,pdat$Exposure,pdat$n))
+all_cor_dat_cors<-rbind(all_cor_dat_cors,cors)
+all_cor_dat_pvals<-rbind(all_cor_dat_pvals,pvals)
+
+```
+
+
+###Telomere length
+####Telomere length estimation
+```{r child = 'Telomere_length.Rmd'}
+```
+####Correlation between telomere length and CN signature exposures
+We adjusted the observed tumour sample telomere length to account for ploidy: adj_length=length*(1/purity). We then calculated the spearman rank correlation for all samples with exposures in a signature greater than 10%.
+```{r fig.height=3}
+library(ppcor)
+telo<-read.table("data/telomere_length_48_tumor.csv",sep=",",header=T,stringsAsFactors = F)
+ID<-gsub("^.*?JBLAB","JBLAB",telo$Sample)
+ID<-gsub("-ready.bam","",ID)
+purity<-pData(all_CN[,colnames(all_CN)%in%ID])[,c("name","purity")]
+purity_ploidy<-cbind(purity,getPloidy(all_CN[,colnames(all_CN)%in%ID]))
+patient<-unlist(lapply(strsplit(telo$Sample,"_"),"[[",1))
+telo<-data.frame(ID,patient,length=telo$Length,stringsAsFactors = F)
+colnames(purity_ploidy)<-c("name","purity","ploidy")
+telo<-merge(telo,purity_ploidy,by.x=1,by.y=1)
+
+telo<-cbind(telo,age=surv_dat[match(telo$patient,surv_dat$TRIALNO),"AGE"])
+telo<-telo[!is.na(telo$age),]
+
+pdat<-reshape2::melt(cbind(sig_pat_mat_britroc,sig_pat_mat_remain))
+colnames(pdat)<-c("Signature","ID","Exposure")
+pdat<-merge(pdat,telo,by.x=2,by.y=1)
+
+cors <- plyr::ddply(pdat, c("Signature"), summarise, cor = pcor.test(Exposure, length,c(purity,age),method="s")$estimate)
+pvals <- plyr::ddply(pdat, c("Signature"), summarise, pval = pcor.test(Exposure, length,c(purity,age),method="s")$p.value)
+cors$Signature<-as.character(1:nsig)
+pvals$Signature<-as.character(1:nsig)
+cors$Feature<-"Telomere length"
+pvals$Feature<-"Telomere length"
+
+integrated_matrix<-cbind("Telomere length",cors[,1:2],pvals[,2],p.adjust(pvals[,2],method="BH"))
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-rbind(all_corrs,integrated_matrix[integrated_matrix$qvalue<0.1&!is.na(integrated_matrix$qvalue<0.1),])
+
+pdat$Signature<-plyr::revalue(pdat$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+p<-ggplot(pdat,aes(x=Exposure,y=as.numeric(length)/1000))+geom_point(size=0.1)+geom_smooth(method = lm)+facet_wrap(~Signature,ncol = nsig,scales="free_x")+
+  coord_cartesian(ylim = c(0,12))+
+  geom_text(size=2,data=cors, aes(label=paste0("r== ", round(cor,2))),x=0.1, y=10, hjust=-0.05, vjust=0,parse = T)+
+    geom_text(size=2,data=pvals, aes(label=paste0("p== ", round(pval,4))), x=0.1, y=8, hjust=-0.05, vjust=0,parse=T)+ ylab("")+theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=7),
+  strip.text.x = element_blank(),strip.background = element_blank())
+p
+
+pvals$pval<-p.adjust(pvals$pval,method="BH")
+
+all_cor_dat<-rbind(all_cor_dat,cbind("Telomere length",pdat$Signature,pdat$Exposure,pdat$length))
+all_cor_dat_cors<-rbind(all_cor_dat_cors,cors)
+all_cor_dat_pvals<-rbind(all_cor_dat_pvals,pvals)
+
+```
+
+###Fold-back inversion events
+
+####Amplification associated fold-back inversion estimation
+```{r child = 'Amplified_FBI_estimation.Rmd'}
+```
+
+####Correlation between number of FBI events and CN signature exposures
+```{r fig.height=3}
+fbi<-read.table("data/pcawg_amplified_FBI_fraction.txt",sep="\t",header=T,stringsAsFactors = F)
+
+pdat<-reshape2::melt(sig_pat_mat_pcawg)
+colnames(pdat)<-c("Signature","ID","Exposure")
+pdat<-merge(pdat,fbi,by.x=2,by.y=1,all.x=T)
+pdat<-pdat[!is.na(pdat$amp_FBI),]
+pdat<-pdat[!pdat$amp_FBI==0,]
+
+cors <- plyr::ddply(pdat, c("Signature"), summarise, cor = cor.test(Exposure, amp_FBI,method="p",exact=T)$estimate)
+pvals <- plyr::ddply(pdat, c("Signature"), summarise, pval = cor.test(Exposure, amp_FBI,method="p",exact=T)$p.value)
+cors$Signature<-as.character(1:nsig)
+pvals$Signature<-as.character(1:nsig)
+cors$Feature<-"Amp FBI"
+pvals$Feature<-"Amp FBI"
+
+pdat$Signature<-plyr::revalue(pdat$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+p<-ggplot(pdat,aes(x=Exposure,y=as.numeric(amp_FBI)))+geom_point(size=0.1)+geom_smooth(method = lm)+facet_wrap(~Signature,ncol = nsig,scales="free_x")+
+  coord_cartesian(ylim = c(0,0.1))+
+  geom_text(size=2,data=cors, aes(label=paste0("r== ", round(cor,2))),x=0.1, y=0.075, hjust=-0.05, vjust=0,parse = T)+
+    geom_text(size=2,data=pvals, aes(label=paste0("p== ", round(pval,4))), x=0.1, y=0.085, hjust=-0.05, vjust=0,parse=T)+ ylab("")+theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=7),
+  strip.text.x = element_blank(),strip.background = element_blank())
+p
+
+integrated_matrix<-cbind("Amplification associated fold-back inversions",cors[,1:2],pvals[,2],p.adjust(pvals[,2],method="BH"))
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-rbind(all_corrs,integrated_matrix[integrated_matrix$qvalue<0.05&abs(integrated_matrix$Correlation)>0.25&!is.na(integrated_matrix$qvalue<0.05),])
+
+pvals$pval<-p.adjust(pvals$pval,method="BH")
+
+all_cor_dat<-rbind(all_cor_dat,cbind("Amp FBI",pdat$Signature,pdat$Exposure,pdat$amp_FBI))
+all_cor_dat_cors<-rbind(all_cor_dat_cors,cors)
+all_cor_dat_pvals<-rbind(all_cor_dat_pvals,pvals)
+
+```
+
+###Age at diagnosis
+```{r fig.height=3}
+age<-c(pcawg_surv_dat$donor_age_at_diagnosis,tcga_clin$age_at_initial_pathologic_diagnosis)
+age<-data.frame(ID=c(rownames(pcawg_surv_dat),rownames(tcga_clin)),age,stringsAsFactors = F)
+pdat<-reshape2::melt(cbind(sig_pat_mat_pcawg,sig_pat_mat_tcga))
+colnames(pdat)<-c("Signature","ID","Exposure")
+pdat<-merge(pdat,age,by.x=2,by.y=1)
+
+cors <- plyr::ddply(pdat, c("Signature"), summarise, cor = cor.test(Exposure, age,method="p",exact=T)$estimate)
+pvals <- plyr::ddply(pdat, c("Signature"), summarise, pval = cor.test(Exposure, age,method="p",exact=T)$p.value)
+cors$Signature<-as.character(1:nsig)
+pvals$Signature<-as.character(1:nsig)
+cors$Feature<-"Age diagnosis"
+pvals$Feature<-"Age diagnosis"
+pdat$Signature<-plyr::revalue(pdat$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+
+ggplot(pdat,aes(x=Exposure,y=as.numeric(age)))+geom_point(size=0.1)+geom_smooth(method = lm)+facet_wrap(~Signature,ncol = nsig,scales="free_x")+
+  coord_cartesian(ylim = c(0,100))+
+  geom_text(size=2,data=cors, aes(label=paste0("r== ", round(cor,2))),x=-Inf, y=15, hjust=-0.05, vjust=0,parse = T)+
+    geom_text(size=2,data=pvals, aes(label=paste0("p== ", round(pval,4))), x=-Inf, y=5, hjust=-0.05, vjust=0,parse=T)+ ylab("Age at diagnosis")+theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=5),
+  strip.text.x = element_text(size = 5))
+
+
+cors$Signature<-as.character(1:nsig)
+integrated_matrix<-cbind("Age",cors[,1:2],pvals[,2],p.adjust(pvals[,2],method="BH"))
+colnames(integrated_matrix)<-c("Variable","Signature","Correlation","pvalue","qvalue")
+all_corrs<-rbind(all_corrs,integrated_matrix[integrated_matrix$qvalue<0.05&abs(integrated_matrix$Correlation)>0.25&!is.na(integrated_matrix$qvalue<0.05),])
+pvals$pval<-p.adjust(pvals$pval,method="BH")
+
+all_cor_dat<-rbind(all_cor_dat,cbind("Age diagnosis",pdat$Signature,pdat$Exposure,pdat$age))
+all_cor_dat_cors<-rbind(all_cor_dat_cors,cors)
+all_cor_dat_pvals<-rbind(all_cor_dat_pvals,pvals)
+```
+
+###Plot of all correlations
+```{r echo=FALSE, fig.height=8}
+colnames(all_cor_dat)<-c("Feature","Signature","Exposure","Value")
+all_cor_dat<-data.frame(all_cor_dat,stringsAsFactors = F)
+
+all_cor_dat$Feature<-plyr::revalue(all_cor_dat$Feature,
+                                   c(Signature.1="SNV signature 1",
+                                     Signature.3="SNV signature 3",
+                                     Signature.5="SNV signature 5",
+                                     Signature.16="SNV signature 16",
+                                     Signature.13="SNV signature 13",
+                                     "Shatterproof score"="Number of\nchromothriptic-like\nevents"))
+all_cor_dat_cors$Feature<-plyr::revalue(all_cor_dat_cors$Feature,
+                                   c(Signature.1="SNV signature 1",
+                                     Signature.3="SNV signature 3",
+                                     Signature.5="SNV signature 5",
+                                     Signature.13="SNV signature 13",
+                                     Signature.16="SNV signature 16",
+                                     "Shatterproof score"="Number of\nchromothriptic-like\nevents"))
+all_cor_dat_pvals$Feature<-plyr::revalue(all_cor_dat_pvals$Feature,
+                                   c(Signature.1="SNV signature 1",
+                                     Signature.3="SNV signature 3",
+                                     Signature.5="SNV signature 5",
+                                     Signature.13="SNV signature 13",
+                                     Signature.16="SNV signature 16",
+                                     "Shatterproof score"="Number of\nchromothriptic-like\nevents"))
+
+all_cor_dat$Feature<-factor(all_cor_dat$Feature,levels=rev(c("SNV signature 16","SNV signature 13","SNV signature 5","SNV signature 3","SNV signature 1","TDP score","Telomere length","Amp FBI","Age diagnosis","Number of\nchromothriptic-like\nevents")))
+
+all_cor_dat_pvals$Feature<-factor(all_cor_dat_pvals$Feature,levels=rev(c("SNV signature 16","SNV signature 13","SNV signature 5","SNV signature 3","SNV signature 1","TDP score","Telomere length","Amp FBI","Age diagnosis","Number of\nchromothriptic-like\nevents")))
+all_cor_dat_cors$Feature<-factor(all_cor_dat_cors$Feature,levels=rev(c("SNV signature 16","SNV signature 13","SNV signature 5","SNV signature 3","SNV signature 1","TDP score","Telomere length","Amp FBI","Age diagnosis","Number of\nchromothriptic-like\nevents")))
+
+all_cor_dat$highlight<-FALSE
+
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(3,6)&all_cor_dat$Feature=="Age diagnosis"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature=="1"&all_cor_dat$Feature=="Amp FBI"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(1,4)&all_cor_dat$Feature=="Telomere length"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(1,2,6)&all_cor_dat$Feature=="TDP score"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(3,6)&all_cor_dat$Feature=="SNV signature 1"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(1,3,6,7)&all_cor_dat$Feature=="SNV signature 3"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(2)&all_cor_dat$Feature=="SNV signature 5"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(5)&all_cor_dat$Feature=="SNV signature 16"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(6)&all_cor_dat$Feature=="SNV signature 13"]<-TRUE
+all_cor_dat$highlight[all_cor_dat$Signature%in%c(5)&all_cor_dat$Feature=="Number of\nchromothriptic-like\nevents"]<-TRUE
+
+cp<-ggplot(all_cor_dat,aes(x=as.numeric(Exposure),y=as.numeric(Value)))+
+  geom_rect(data = all_cor_dat,aes(fill = highlight==TRUE),xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.1)+
+  geom_point(size=0.1)+geom_smooth(method = lm)+facet_grid(Feature~Signature,scales="free")+#coord_cartesian(xlim=c(0,1))+
+  xlab("Exposures")+ylab("Feature values")+
+  theme_bw()+theme(axis.text=element_text(size=5),axis.title=element_text(size=5),
+  strip.text.x = element_text(size = 7),strip.text.y = element_text(size = 5),legend.position = "none")+scale_fill_manual(values=c("white","grey"))+
+  geom_text(size=1.7,data=all_cor_dat_cors, aes(label=paste0("r=", round(as.numeric(cor),2))),x=-0.005, y=Inf,parse = F,hjust=0, vjust=1.5)+
+    geom_text(size=1.7,data=all_cor_dat_pvals, aes(label=paste0("P=", format(signif(as.numeric(pval),1),digits=1, scientific = T))), x=0.37, y=Inf, hjust=0, vjust=1.5,parse=F)
+cp
+
+```
+
+
+
+###Plot of all associations
+```{r echo=FALSE}
+all_diff_exp$qvalue[as.numeric(all_diff_exp$qvalue)<0.000001]<-0.000001
+all_diff_exp$Signature<-factor(all_diff_exp$Signature,levels=1:nsig)
+
+all_diff_exp$Description<-plyr::revalue(all_diff_exp$Description,c(
+                       "PI3K/AKT Signaling in Cancer"="PI3K/AKT signaling",
+                       "Cyclin E associated events during G1/S transition "="Cyclin E events in G1/S",
+                       "Interleukin-4 and 13 signaling"="Interleukin signaling",
+                       "Regulation of RAS by GAPs"="RAS signaling",
+                       "Signaling by Wnt"="Wnt signaling",
+                       "Cell-Cell communication"="PAK signaling",
+                       "Cyclin D associated events in G1"="Cyclin D events in G1",
+                       "Toll Like Receptor 3 (TLR3) Cascade"="Toll-Like receptors cascades",
+                       "HDR through Homologous Recombination (HRR)"="Homologous recombination"))
+
+
+p<-ggplot(all_diff_exp, aes(y = factor(Description),
+             x = factor(Signature))) +        ## global aes
+  geom_point(aes(fill = as.numeric(mean_diff)
+                   #size = -log10(as.numeric(qvalue))
+                 ), size=2,pch=21,stroke=0.05)  +    ## geom_point for circle illusion
+  scale_fill_gradient2(low = "white",high = "darkgreen",limits=c(0.1,0.4))+       ## color of the corresponding aes
+  theme_bw()+theme(
+    legend.position="none",plot.margin = unit(c(0,0,0,0), "cm"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  ylab("")+xlab("")+theme(
+                   axis.text=element_text(size=5),axis.title=element_text(size=5),
+                   strip.text.x = element_text(size = 5),
+                   strip.text.y = element_text(size = 5),
+                   legend.text = element_text(size = 5))+
+  scale_x_discrete(limits=1:nsig)
+
+
+all_diff_exp$qvalue[as.numeric(all_diff_exp$qvalue)<0.000001]<-0.000001
+all_diff_exp$Signature<-factor(all_diff_exp$Signature,levels=1:nsig)
+
+d_mut_ratio_info$Signature<-plyr::revalue(d_mut_ratio_info$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+d_mut_ratio_info$Signature<-factor(d_mut_ratio_info$Signature,levels=1:nsig)
+
+
+t<-ggplot(d_mut_ratio_info, aes(y = factor(Gene),
+             x = factor(Signature))) +        ## global aes
+  geom_point(aes(fill = as.numeric(median_diff)
+                   #size = -log10(as.numeric(qvalue))
+                 ), size=2,pch=21,stroke=0.05)  +    ## geom_point for circle illusion
+  scale_fill_gradient2(low = "blue", mid = "white",high = "darkgreen",midpoint=0,limits=c(0.08,0.4))+       ## color of the corresponding aes
+  theme_bw()+theme(
+    axis.text.x = element_blank(),
+    legend.position="none",plot.margin = unit(c(0,0,0,0), "cm"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  ylab("")+xlab("")+theme(
+                   axis.text=element_text(size=5),axis.title=element_text(size=5),
+                   strip.text.x = element_text(size = 5),
+                   strip.text.y = element_text(size = 5),
+                   legend.text = element_text(size = 5),
+                   axis.ticks.x = element_blank())+
+  scale_x_discrete(limits=1:nsig)
+
+
+
+all_corrs$qvalue[as.numeric(all_corrs$qvalue)<0.000001]<-0.000001
+
+all_corrs$Variable=plyr::revalue(all_corrs$Variable,c(Age="Age at diagnosis",
+                             Signature.1="Age-associated SNV signature 1",
+                             Signature.3="HRD SNV signature 3",
+                             Signature.5="SNV signature 5",
+                             Signature.16="SNV signature 16",
+                             Signature.13="APOBEC SNV signature 13",
+                             "Shatterproof score"="Number of chromothriptic-like events"))
+
+pdat_cor1<-all_corrs[1:9,]
+
+pdat_cor2<-all_corrs[10:18,]
+
+pdat_cor1$Variable<-factor(pdat_cor1$Variable,levels=rev(c("Age-associated SNV signature 1",
+                                                       "HRD SNV signature 3","SNV signature 5","APOBEC SNV signature 13","SNV signature 16")))
+
+q<-ggplot(pdat_cor1, aes(y = factor(Variable),
+             x = factor(Signature))) +        ## global aes
+  geom_point(aes(fill = as.numeric(Correlation)),size=2,pch=21,stroke=0.05)+
+  scale_fill_gradient2(low = "orange", mid = "white",high = "darkblue",midpoint=0,limits=c(-1,1))+
+  theme_bw()+theme(
+    legend.position="none",plot.margin = unit(c(0,0,0,0), "cm"))+
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+
+  ylab("")+xlab("")+theme(
+                   axis.text=element_text(size=5),axis.title=element_text(size=5),
+                   strip.text.x = element_text(size = 5),
+                   strip.text.y = element_text(size = 5),
+                   legend.text = element_text(size = 5),
+                   axis.text.x = element_blank(),
+                   axis.ticks.x = element_blank())+
+  scale_x_discrete(limits=1:nsig)
+
+
+z<-ggplot(pdat_cor2, aes(y = factor(Variable),
+             x = factor(Signature))) +        ## global aes
+  geom_point(aes(fill = as.numeric(Correlation)),size=2,pch=21,stroke=0.05)+
+                  # size = -log10(as.numeric(qvalue))))  +    ## geom_point for circle illusion
+  scale_fill_gradient2(low = "orange", mid = "white",high = "darkblue",midpoint=0,limits=c(-1,1))+       ## color of the corresponding aes
+  theme_bw()+theme(
+    axis.text.x = element_blank(),
+    legend.position="none",plot.margin = unit(c(0,0,0,0), "cm"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  ylab("")+xlab("")+theme(
+                   axis.text=element_text(size=5),axis.title=element_text(size=5),
+                   strip.text.x = element_text(size = 5),
+                   strip.text.y = element_text(size = 5),
+                   legend.text = element_text(size = 5),
+                   axis.ticks.x = element_blank())+
+  scale_x_discrete(limits=1:nsig)
+
+
+cowplot::plot_grid(z,q,t,p,align="v",ncol=1,rel_heights = c(1,1,1.4,1.8))
+```
+
+###BRCA1/2 germline carriers
+```{r echo=TRUE,eval=F}
+#this chunk of code is not run be default due to data restrictions. 
+#to run this code please download hrd_germline_w_CN_exposures.txt into the restricted_data directory and ensure previous restricted data code chunks are run
+brca_cases<-read.table("restricted_data/hrd_germline_w_CN_exposures.txt",header=T,stringsAsFactors = F)
+brca_loc<-gene_coords[gene_coords$gene=="BRCA1"|gene_coords$gene=="BRCA2",]
+BRCAmuts<-HRmuts[(!HRmuts$Type=="nonsynonymous")&(!HRmuts$Gene=="WT"),]
+BRCAmuts<-BRCAmuts[!is.na(BRCAmuts$Gene),]
+BRCAmuts<-merge(brca_cases,BRCAmuts,by.x=1,by.y=1)
+
+res<-c()
+for(j in 1:nrow(BRCAmuts))
+{
+  name<-BRCAmuts[j,"Gene"]
+  chr<-brca_loc[brca_loc$gene==name,"chr"]
+  tss<-abs(as.numeric(brca_loc[brca_loc$gene==name,"tss"]))
+  segTable<-all_segTabs[[BRCAmuts[j,"ID"]]]
+  cn<-as.numeric(segTable[segTable[,1]==chr&as.numeric(segTable[,2])<tss&as.numeric(segTable[,3])>tss,4])
+    if(!length(cn)==1)
+    {
+      modtss<-tss+1000000
+      cn<-as.numeric(segTable[segTable[,1]==chr&as.numeric(segTable[,2])<modtss&as.numeric(segTable[,3])>modtss,4])
+      if(!length(cn)==1)
+      {
+      cn<-NA
+      }
+    }
+    res<-c(res,cn)
+}
+BRCAmuts$cn<-res
+BRCAmuts$LOH<-res<1.4
+BRCAmutloh<-BRCAmuts[BRCAmuts$LOH&BRCAmuts$Gene=="BRCA2","ID"]
+```
+
+```{r}
+pdat_sig<-reshape2::melt(sig_pat_mat_britroc_all)
+colnames(pdat_sig)<-c("Signature","Patient","Exposure")
+
+BRCAmutloh<-c("JBLAB-4195","JBLAB-4127","JBLAB-4162","IM_160")
+
+pdat_brca<-pdat_sig[pdat_sig$Patient%in%BRCAmutloh,]
+
+pdat_brca$Patient<-factor(pdat_brca$Patient,levels=c("JBLAB-4195","JBLAB-4127","JBLAB-4162","IM_160"))
+
+pdat_brca$Signature<-plyr::revalue(pdat_brca$Signature,c(s1=1,s2=2,s3=3,s4=4,s5=5,s6=6,s7=7))
+
+p<-ggplot(pdat_brca,aes(x=Patient,y=Exposure,fill=Signature))+geom_bar(stat="identity")+theme_bw()+
+      scale_fill_manual( values = cbPalette)+
+      theme(axis.text.x = element_blank(),axis.ticks.x=element_blank(),
+            axis.text=element_text(size=7),axis.title=element_text(size=7),
+            legend.text = element_text(size = 7),legend.title=element_text(size=7),
+            legend.position='right',
+            plot.margin = margin(0, 0, 0, 0, "cm"))+ylim(c(0,1))+xlab("BRCA2 germline mutation carriers + somatic LOH (n=4)")+
+      ylab("Exposures")
+p
+```
+

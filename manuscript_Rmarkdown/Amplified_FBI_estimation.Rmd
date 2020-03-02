@@ -1,0 +1,73 @@
+---
+title: "Amplification associated fold-back inversion estimation"
+author: "Dilrini De Silva"
+output: html_document
+---
+
+This file describes how to calculate the proportion of amplification associated fold-back inversions (ampFBI) from head-to-head inversion (h2hINV) type structural variants and copy-number information. For each sample, the no. of h2hINVs found in a 200kbp region centred around an amplified copy-number segment (CN >=5) was calculated. The proportion of ampFBI was defined as the no. of such h2hINVs relative to the total no. of structural variants in the sample. The X chromosome was left out of analyses.
+
+```{r}
+suppressMessages(library(Biobase))
+suppressMessages(library(GenomicRanges))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+```
+
+```{r, ampFBI, eval=F}
+pcawg_cohort_info <- read.table("data/pcawg_cohort_info.tsv", header=T, sep="\t", as.is = T)
+pcawg_ids <- pcawg_cohort_info$tumor_wgs_aliquot_id
+path <- "restricted_data/pcawg_sv/"
+ext <- ".pcawg_consensus_1.6.161116.somatic.sv.bedpe.gz"
+pcawg_ov_filelist  <- paste0(path, pcawg_ids, ext)
+
+# Select ids for which both structural variant and copy-number information exist
+ids <- pcawg_ids[pcawg_ids %in% names(pcawg_segTabs)]
+segTable_colnames <- colnames(pcawg_segTabs[[1]])
+
+ampFBI <- list()
+
+for(sample_name in ids){
+  # the no. of amplification-associated fold-back inversions in each sample
+  n_amplifiedFBI <- 0 
+  file_name <- paste0(filepath,sample_name,ext)
+  sv <- read.table(file_name,header=T, sep ="\t", as.is = T)
+  sv <- filter(sv, chrom1 != "X")
+  totalSVs <- dim(sv)[1]
+  h2h_count <- filter(sv,  svclass == "h2hINV") %>%
+    summarise(n=n()) %>%
+    .$n
+
+  
+  if(h2h_count>0){
+    
+    h2h_df <- filter(sv,  svclass == "h2hINV") %>%
+      select(chrom1,start1,end2) %>%
+      mutate(start1 = start1-1e5, end2 = end2+1e5) %>% # add 100KB to either side
+      rename(chr=chrom1, start=start1, end=end2)
+  
+    h2h_granges <- makeGRangesFromDataFrame(h2h_df)
+    seg_granges <- makeGRangesFromDataFrame(pcawg_segTabs[sample_name],  keep.extra.columns = T)
+    # identify segments overlapping h2hINVs 
+    hits <- findOverlaps(h2h_granges,seg_granges)
+    # filter hits where copy-number >= 5 
+    CN <- as.numeric(elementMetadata(seg_granges )[,1])
+    highCNhits <- subjectHits(hits)[subjectHits(hits) %in% which(CN >=5)]
+  
+    if(length(highCNhits)>0){
+      subset_hits <- hits[subjectHits(hits) %in% highCNhits]
+      qHits <- queryHits(subset_hits)
+      # count once if h2hINV overlaps multiple segments
+      n_amplifiedFBI <- length(unique(qHits))/totalSVs
+      
+    }
+   
+  }
+  
+  ampFBI[[sample_name]] <- n_amplifiedFBI
+
+}
+
+ampFBI.df <- data.frame(names(ampFBI),unlist(ampFBI), stringsAsFactors = F)
+colnames(ampFBI.df) <- c("ID", "amp_FBI")
+write.table(ampFBI.df, "data/pcawg_amplified_FBI_fraction.txt", sep="\t", quote=F, row.names = F)
+```

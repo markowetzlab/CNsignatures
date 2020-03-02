@@ -1,0 +1,19 @@
+---
+title: "Telomere length estimation"
+author: "Dilrini De Silva"
+output: html_document
+---
+
+Telomere lengths of deep WGS samples were estimated using the Telomerecat software <http://telomerecat.readthedocs.org/>. 
+ 
+Telomerecat was installed using the python installer:
+
+```{bash, eval=F}
+pip install telomerecat
+```
+
+Once installed, the following command was used to output a length estimate for a given BAM file:
+```{bash, eval=F}
+telomerecat bam2length /path/to/bamfile.bam
+```
+

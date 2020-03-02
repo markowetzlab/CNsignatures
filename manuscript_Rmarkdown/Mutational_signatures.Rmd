@@ -1,0 +1,169 @@
+---
+title: "Extract COSMIC mutational signature exposures from SNV calls"
+author: "Dilrini De Silva"
+output: html_document
+---
+
+####Extract COSMIC mutational signature exposures from SNV calls
+This section describes how the trinuleotide motif matrices were extracted from deepWGS Britoc-1 and PCAWG samples using the SomaticSignatures R package and mutational signature exposures extracted using the deconstructSigs R package.  
+
+The VCF files can be obtained by writing to the relevant Data Access Committees and placed in *data/britroc/snv/* and *restricted_data/pcawg_snv/* before running the code below. The human genome reference files used in each cohort should be placed in *data/reference/britroc/GRCh37.fa* and *restricted_data/reference/pcawg/genome.fa*.  
+
+The motif matrix files derived from the SNV calls used to generate the COSMIC mutational signature exposures of both cohorts are provided.
+
+```{r}
+suppressMessages(library(dplyr))
+suppressMessages(library(SomaticSignatures))
+suppressMessages(library(deconstructSigs))
+suppressMessages(library(NMF))
+```
+
+
+```{r}
+# Helper functions to extract information from VCF files
+
+# Filter variants passing all filters in the VCF file
+filterPass <- function(vrobj){
+  
+  if(dim(softFilterMatrix(vrobj))[2] !=0){
+    nfilters <- dim(softFilterMatrix(vrobj))[2]
+    vr <- vrobj[which(rowSums(softFilterMatrix(vrobj)) ==nfilters)]
+  }else{
+    vr <- vrobj
+  }
+  return(vr)
+}
+
+# Extract trinulceotide frequencies from VCF file
+createMotifMatrix <- function(vcffile){
+    
+    s <- samples(scanVcfHeader(vcffile))
+    s <- s[grep("tumor",s)] # select the tumor sample from the vcf which contains both the tumour and matched normal variants
+    vr_in <- readVcfAsVRanges(vcffile, "hg19", param = ScanVcfParam(info=NA, samples=s,geno="GT"))
+    vr <- filterPass(vr_in)
+    motifs <- mutationContext(vr,ref_fasta)
+    mm <- motifMatrix(motifs)
+  
+    return(mm)
+}
+
+
+# Extract mutational signature exposures
+
+getWeights <- function(motifmatrix,signature){
+  
+  # convert to format required by deconstructSigs
+  mm <- data.frame(t(motifmatrix))
+  # use the column names in the deconstructSigs signatures dataframe
+  colnames(mm) <- colnames(signature)
+  
+  wt_df <- data.frame()
+  
+  for(s in rownames(mm)){
+    ws <- whichSignatures(tumor.ref = mm, signatures.ref = signature, sample.id = s)
+    #add unknown component
+    Unknown <- ws$unknown
+    wt_df <- rbind(wt_df,cbind(ws$weights,Unknown))
+  }
+  return(wt_df)
+}
+
+
+```
+
+
+#####Britroc-1
+The code below is to generate the motif matrix for the Britroc cohort from the original snv calls. 
+```{r, eval=F}
+#Extract trinucleotide frequencies from the BritROC-1 SNV calls
+
+# Subset to list of samples passing QC
+samplestatus <- read.csv("data/britroc_deepWGS_sample_status.csv", as.is=T)
+trialno <- unique(samplestatus$britroc_ID[samplestatus$status=="final"])
+
+# Create FaFile object from Reference
+ref_fasta <- FaFile("data/reference/britroc/GRCh37.fa")
+
+# Create motif matrix from deepWGS BriTROC-1 data
+vcfpath <- "data/britroc/snv/"
+pat <- "snv.filters.blacklist.vcf" #  suffix of VCF files to be processed
+vcflist <- list.files(vcfpath, full.names=TRUE, pattern=pat)
+  
+# select samples passing QC 
+pat <- gsub("[$]", "", pat)
+vcf_in <- paste0(vcfpath,"/", trialno, ".", pat)
+  
+# Select only files that exist
+vcf_in <- vcf_in[vcf_in %in% vcflist]
+  
+motifmat_list <- lapply(vcf_in, createMotifMatrix)
+motifmat <- do.call(cbind.data.frame, motifmat_list)
+write.table(motifmat, "data/britroc_deepWGS_snv_motif_matrix.txt", sep = "\t", quote=F)
+
+cosmic_weights <- getWeights(motifmat,signatures.cosmic)
+cosmic_out <- cbind.data.frame(row.names(cosmic_weights), cosmic_weights, stringsAsFactors=F)
+colnames(cosmic_out)[1] <- "Sample"
+cosmic_outfile <- "data/britroc_cosmic_weights.txt"
+write.table(cosmic_out, file = cosmic_outfile, row.names = F, quote = F,sep="\t")
+```
+
+The code below is to get mutational signature exposures for the Britroc cohort from the motif matrix file generated above. 
+```{r, britroc_mut_sigs, cache=T}
+# Extract weights of COSMIC mutational signatures from the BriTROC-1 cohort
+motifmat <- read.table("data/britroc_deepWGS_snv_motif_matrix.txt", sep="\t", header=T)
+cosmic_weights <- getWeights(motifmat,signatures.cosmic)
+rownames(cosmic_weights) <- gsub("X","",rownames(cosmic_weights))
+rownames(cosmic_weights) <- gsub("[.]","-",rownames(cosmic_weights))
+cosmic_out <- cbind.data.frame(row.names(cosmic_weights), cosmic_weights, stringsAsFactors=F)
+colnames(cosmic_out)[1] <- "Sample"
+cosmic_outfile <- "data/britroc_cosmic_weights.txt"
+write.table(cosmic_out, file = cosmic_outfile, row.names = F, quote = F,sep="\t")
+```
+
+##### PCAWG
+The code below is to generate the motif matrix for the PCAWG cohort from the original snv calls. 
+```{r, pcawg_motif_mat, eval=F}
+# Extract trinucleotide frequencies from the PCAWG (OV-AU, OV-US) SNV calls
+pcawg_cohort_info <- read.table("data/pcawg_cohort_info.tsv", header=T, sep="\t", as.is = T)
+pcawg_ids <- pcawg_cohort_info$tumor_wgs_aliquot_id
+
+# Consensus SNV data must be placed in the following directory and files must have the
+# .consensus.20160830.somatic.snv_mnv.vcf.gz extension
+snvdir <-"restricted_data/pcawg_snv/"
+ext <- ".consensus.20160830.somatic.snv_mnv.vcf.gz"
+pcawg_ov_filelist  <- paste0(snvdir,pcawg_ids, ext)
+pcawg_ref <- FaFile("restricted_data/reference/pcawg/genome.fa")
+pcawg_vranges <- lapply(pcawg_ov_filelist, readVcfAsVRanges, param = ScanVcfParam(info=NA))
+pcawg_vranges <- lapply(
+  seq_along(pcawg_vranges), function(v, n, i) {
+    sampleNames(v[[i]]) = n[i]; v[[i]]
+    }, 
+  v = pcawg_vranges, 
+  n = pcawg_ids
+  )
+pcawg_mc <- lapply(pcawg_vranges, mutationContext, pcawg_ref) 
+pcawg_mm <- data.frame(lapply(pcawg_mc, motifMatrix))
+write.table("data/pcawg_snv_motif_matrix.txt", sep="\t", quote=F)
+
+pcawg_cosmic_weights <- getWeights(pcawg_mm, signatures.cosmic)
+pcawg_samplenames <- sub("X", "",row.names(pcawg_cosmic_weights))
+pcawg_samplenames <- gsub("[.]", "-", pcawg_samplenames)
+pcawg_out <- cbind.data.frame(pcawg_samplenames,pcawg_cosmic_weights)
+colnames(pcawg_out)[1] <- "Sample"
+pcawg_cosmic_outfile <- "data/pcawg_cosmic_weights.txt"
+write.table(pcawg_out, file = pcawg_cosmic_outfile, row.names=F, quote = F, sep="\t")
+```
+The code below is to get mutational signature exposures for the PCAWG cohort from the motif matrix file (pcawg_mm) generated above. 
+
+```{r, pcawg_mut_sigs, cache=T}
+# Extract weights of COSMIC mutational signatures 
+pcawg_mm <- read.table("data/pcawg_snv_motif_matrix.txt", as.is=T, header=T, sep="\t")
+pcawg_cosmic_weights <- getWeights(pcawg_mm, signatures.cosmic)
+pcawg_samplenames <- sub("X", "",row.names(pcawg_cosmic_weights))
+pcawg_samplenames <- gsub("[.]", "-", pcawg_samplenames)
+pcawg_out <- cbind.data.frame(pcawg_samplenames,pcawg_cosmic_weights, stringsAsFactors=F)
+colnames(pcawg_out)[1] <- "Sample"
+pcawg_cosmic_outfile <- "data/pcawg_cosmic_weights.txt"
+write.table(pcawg_out, file = pcawg_cosmic_outfile, row.names=F, quote = F,sep="\t")
+```
+
