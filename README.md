@@ -1,6 +1,9 @@
+# CNsignatures
+
+## **If you wish to generate copy number signature activities / exposures you can do so using the [CINSignatureQuantification](https://github.com/markowetzlab/CINSignatureQuantification) R package which supports both the new pan-cancer copy number signatures and the ovarian copy number signatures (ones described in this repository).**
+
 This repository contains all code and documentation necessary to reproduce the analysis undertaken in the 
 manuscript [Copy-number signatures and mutational processes in ovarian carcinoma](https://www.biorxiv.org/content/early/2017/09/04/174201)
-
 
 ### Source code
 The source code for copy-number signature analysis is split across two files:   
